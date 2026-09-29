@@ -1,0 +1,5 @@
+/target
+zabbix-ctl.toml
+*.log
+.idea/
+.vscode/

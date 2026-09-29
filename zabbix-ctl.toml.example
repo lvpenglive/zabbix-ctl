@@ -1,0 +1,35 @@
+# 复制为 zabbix-ctl.toml。令牌不要写进此文件。
+# ZABBIX_CTL_SERVICE_TOKEN — Gateway 调本服务
+# ZBX_TOKEN_{CODE} — 对应 Zabbix API 令牌
+# MERIDIANOPS_JOB_TOKEN — 调 Gateway 作业接口的 API Token（mk- 前缀）
+# MERIDIANOPS_DB_URL — 可覆盖下方 database.url
+
+[server]
+bind = "127.0.0.1:8090"
+
+[database]
+url = "mysql://root:password@127.0.0.1:3306/meridianops"
+max_connections = 5
+
+[meridianops]
+base_url = "http://127.0.0.1:8000"
+# 作业定义 ID，0 表示按下方名称从 job_definitions 自动匹配
+job_start = 0
+job_stop = 0
+job_restart = 0
+job_upgrade = 0
+job_rollback = 0
+job_start_name = "Zabbix Agent 启动"
+job_stop_name = "Zabbix Agent 停止"
+job_restart_name = "Zabbix Agent 重启"
+job_upgrade_name = "Zabbix Agent 升级"
+job_rollback_name = "Zabbix Agent 回滚"
+[[zabbix]]
+code = "dc1"
+name = "主机房 Zabbix"
+api_url = "https://zabbix.example/api_jsonrpc.php"
+enabled = true
+# 标准模板名。主机缺少其中任一则在治理页标为偏离；留空则只展示已挂模板。
+standard_templates = ["Linux by Zabbix agent"]
+proxy_stale_secs = 600
+queue_warn = 1000
