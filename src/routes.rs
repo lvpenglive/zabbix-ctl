@@ -92,7 +92,7 @@ async fn list_hosts(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let client = client_for(&state, &code)?;
     let mut hosts = client
-        .list_hosts(q.limit.unwrap_or(100), q.search.as_deref())
+        .list_hosts(q.limit, q.search.as_deref())
         .await?;
     if let Some(pool) = state.db.as_ref() {
         enrich_hosts_with_links(pool, &code, &mut hosts).await?;

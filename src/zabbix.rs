@@ -7,7 +7,10 @@ use serde_json::{json, Value};
 use crate::config::ZabbixInstanceConfig;
 use crate::error::AppError;
 
-const HOST_LIMIT_MAX: u32 = 200;
+/// 可选 limit 的安全上限（仅当调用方显式传 limit 时生效）。
+const HOST_LIMIT_MAX: u32 = 10_000;
+const LIST_AGENT_KEYS: &[&str] = &["agent.version", "agent.ping"];
+const ITEM_GET_HOST_CHUNK: usize = 500;
 
 /// 只允许这些监控项键，避免把 Zabbix 查询暴露成任意键接口。
 const ITEM_KEYS: &[&str] = &[
@@ -59,15 +62,21 @@ impl ZabbixClient {
             .ok_or_else(|| AppError::internal("Zabbix 未返回版本"))
     }
 
-    pub async fn list_hosts(&self, limit: u32, search: Option<&str>) -> Result<Vec<Value>, AppError> {
-        let limit = limit.clamp(1, HOST_LIMIT_MAX);
+    /// 列出已启用主机。`limit = None` 表示全量（Zabbix host.get 不传 limit）。
+    pub async fn list_hosts(
+        &self,
+        limit: Option<u32>,
+        search: Option<&str>,
+    ) -> Result<Vec<Value>, AppError> {
         let mut params = json!({
             "output": ["hostid", "host", "name", "status"],
             "selectInterfaces": ["ip", "dns", "type", "main", "available"],
             "filter": { "status": 0 },
             "sortfield": "host",
-            "limit": limit,
         });
+        if let Some(n) = limit.filter(|&n| n > 0) {
+            params["limit"] = json!(n.clamp(1, HOST_LIMIT_MAX));
+        }
         if let Some(q) = search.map(str::trim).filter(|s| !s.is_empty()) {
             params["search"] = json!({ "host": q, "name": q });
             params["searchByAny"] = json!(true);
@@ -78,7 +87,10 @@ impl ZabbixClient {
             .iter()
             .filter_map(|h| h["hostid"].as_str().map(|s| s.to_string()))
             .collect();
-        let items = self.items_for_hosts(&host_ids).await?;
+        // 名册只需通断/版本，不拉 CPU 等指标键
+        let items = self
+            .items_for_hosts_with_keys(&host_ids, LIST_AGENT_KEYS)
+            .await?;
         Ok(hosts
             .into_iter()
             .map(|h| map_host(&h, &items))
@@ -175,21 +187,35 @@ impl ZabbixClient {
     }
 
     async fn items_for_hosts(&self, host_ids: &[String]) -> Result<Vec<Value>, AppError> {
+        self.items_for_hosts_with_keys(host_ids, ITEM_KEYS).await
+    }
+
+    async fn items_for_hosts_with_keys(
+        &self,
+        host_ids: &[String],
+        keys: &[&str],
+    ) -> Result<Vec<Value>, AppError> {
         if host_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let result = self
-            .call(
-                "item.get",
-                json!({
-                    "output": ["itemid", "hostid", "key_", "lastvalue", "value_type"],
-                    "hostids": host_ids,
-                    "monitored": true,
-                    "filter": { "key_": ITEM_KEYS },
-                }),
-            )
-            .await?;
-        Ok(result.as_array().cloned().unwrap_or_default())
+        let mut all = Vec::new();
+        for chunk in host_ids.chunks(ITEM_GET_HOST_CHUNK) {
+            let result = self
+                .call(
+                    "item.get",
+                    json!({
+                        "output": ["itemid", "hostid", "key_", "lastvalue", "value_type"],
+                        "hostids": chunk,
+                        "monitored": true,
+                        "filter": { "key_": keys },
+                    }),
+                )
+                .await?;
+            if let Some(arr) = result.as_array() {
+                all.extend(arr.iter().cloned());
+            }
+        }
+        Ok(all)
     }
 
     async fn series_points(&self, item: &Value, from: i64, hours: u32) -> Result<Vec<Value>, AppError> {

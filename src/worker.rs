@@ -464,7 +464,10 @@ pub async fn sync_host_links(
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("未找到实例"))?;
     let zbx = ZabbixClient::new(state.http.clone(), instance)?;
-    let hosts = zbx.list_hosts(200, None).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let hosts = zbx
+        .list_hosts(None, None)
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let mut n = 0usize;
     for h in hosts {
         let host_id = h["hostId"].as_str().unwrap_or("");
