@@ -388,28 +388,60 @@ impl ZabbixClient {
             .collect())
     }
 
-    /// 采集队列积压概况。优先 queue.get，失败则返回不可用说明。
+    /// 采集队列积压概况。
+    /// Zabbix JSON-RPC 没有 queue.*（前端队列走 server 10051 协议）；
+    /// 这里读内部监控项 `zabbix[queue]`（Template App Zabbix Server 通常自带）。
     pub async fn queue_overview(&self, warn_count: u32) -> Result<Value, AppError> {
-        match self.call("queue.get", json!({ "output": "extend", "limit": 5000 })).await {
-            Ok(result) => {
-                let count = result.as_array().map(|a| a.len()).unwrap_or(0) as u32;
-                Ok(json!({
-                    "available": true,
-                    "count": count,
-                    "warn": warn_count,
-                    "backedUp": count >= warn_count,
-                    "source": "queue.get",
-                }))
-            }
+        match self.queue_from_internal_item(warn_count).await {
+            Ok(v) => Ok(v),
             Err(e) => Ok(json!({
                 "available": false,
                 "count": 0,
                 "warn": warn_count,
                 "backedUp": false,
                 "source": "unavailable",
-                "message": e.to_string(),
+                "message": format!(
+                    "未找到监控项 zabbix[queue]，请在 Zabbix Server 主机启用该内部指标（{e}）"
+                ),
             })),
         }
+    }
+
+    async fn queue_from_internal_item(&self, warn_count: u32) -> Result<Value, AppError> {
+        let items = self
+            .call(
+                "item.get",
+                json!({
+                    "output": ["itemid", "name", "key_", "lastvalue", "status", "state", "hostid"],
+                    "filter": { "key_": ["zabbix[queue]"], "status": 0 },
+                    "limit": 20,
+                }),
+            )
+            .await?;
+        let arr = items.as_array().cloned().unwrap_or_default();
+        if arr.is_empty() {
+            return Err(AppError::internal("item.get 无匹配项"));
+        }
+        // 多节点时取最大值，避免漏报积压
+        let mut count: u32 = 0;
+        for item in &arr {
+            let v = item
+                .get("lastvalue")
+                .and_then(|v| {
+                    v.as_str()
+                        .and_then(|s| s.parse::<u32>().ok())
+                        .or_else(|| v.as_u64().map(|n| n as u32))
+                })
+                .unwrap_or(0);
+            count = count.max(v);
+        }
+        Ok(json!({
+            "available": true,
+            "count": count,
+            "warn": warn_count,
+            "backedUp": count >= warn_count,
+            "source": "zabbix[queue]",
+        }))
     }
 
     pub async fn governance(
