@@ -1,0 +1,129 @@
+name: Build Linux
+
+on:
+  push:
+    branches: [master, main]
+    tags: ["v*"]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  linux-x86_64:
+    name: Linux x86_64 (Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Stage package
+        env:
+          PACKAGE_NAME: zabbix-ctl-linux-x86_64
+          PACKAGE_LABEL: Linux x86_64 (glibc / Ubuntu runner)
+        run: bash .github/scripts/package-linux.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zabbix-ctl-linux-x86_64
+          path: dist/zabbix-ctl-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  # GitHub 无官方麒麟 runner：在社区 Kylin V10 SP3 容器内编译，
+  # 贴近银河麒麟高级服务器操作系统 V10 SP3。
+  kylin-v10-sp3-x86_64:
+    name: Kylin V10 SP3 x86_64
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .cargo-kylin
+            .rustup-kylin
+            target
+          key: kylin-v10-sp3-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            kylin-v10-sp3-
+
+      - name: Build inside Kylin V10 SP3 container
+        run: |
+          set -euo pipefail
+          docker pull hxsoong/kylin:v10-sp3
+          docker run --rm \
+            -v "$PWD:/workspace" \
+            -w /workspace \
+            -e CARGO_HOME=/workspace/.cargo-kylin \
+            -e RUSTUP_HOME=/workspace/.rustup-kylin \
+            hxsoong/kylin:v10-sp3 \
+            bash -lc '
+              set -euo pipefail
+              cat /etc/.productinfo 2>/dev/null || true
+              cat /etc/os-release 2>/dev/null || true
+
+              yum install -y \
+                gcc gcc-c++ make \
+                openssl-devel pkgconfig perl \
+                curl ca-certificates tar gzip git \
+                || yum install -y gcc gcc-c++ make openssl-devel pkgconfig perl curl tar gzip
+
+              export PATH="$CARGO_HOME/bin:$PATH"
+              if ! command -v rustc >/dev/null 2>&1; then
+                curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+                  | sh -s -- -y --default-toolchain stable --profile minimal
+              fi
+              # shellcheck source=/dev/null
+              source "$CARGO_HOME/env"
+              rustc -vV
+              cargo build --release
+            '
+
+      - name: Stage package
+        env:
+          PACKAGE_NAME: zabbix-ctl-kylin-v10-sp3-x86_64
+          PACKAGE_LABEL: Kylin V10 SP3 x86_64 (built in hxsoong/kylin:v10-sp3)
+        run: bash .github/scripts/package-linux.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zabbix-ctl-kylin-v10-sp3-x86_64
+          path: dist/zabbix-ctl-kylin-v10-sp3-x86_64.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Attach release assets
+    needs: [linux-x86_64, kylin-v10-sp3-x86_64]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: zabbix-ctl-*
+          merge-multiple: true
+
+      - run: ls -lh dist/
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/zabbix-ctl-linux-x86_64.tar.gz
+            dist/zabbix-ctl-kylin-v10-sp3-x86_64.tar.gz
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
