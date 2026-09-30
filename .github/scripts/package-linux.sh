@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 把 zabbix-ctl release 二进制 + 示例配置打成 tar.gz
+# 把 zabbix-ctl release 二进制 + 示例配置/启动脚本打成 tar.gz
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -10,6 +10,8 @@ cd "$ROOT"
 
 BIN="target/release/zabbix-ctl"
 CFG_EXAMPLE="zabbix-ctl.toml.example"
+ENV_EXAMPLE="config/env.sh.example"
+START_EXAMPLE="scripts/start.sh.example"
 
 if [[ ! -f "$BIN" ]]; then
   echo "missing binary: $BIN" >&2
@@ -17,6 +19,14 @@ if [[ ! -f "$BIN" ]]; then
 fi
 if [[ ! -f "$CFG_EXAMPLE" ]]; then
   echo "missing config example: $CFG_EXAMPLE" >&2
+  exit 1
+fi
+if [[ ! -f "$ENV_EXAMPLE" ]]; then
+  echo "missing env example: $ENV_EXAMPLE" >&2
+  exit 1
+fi
+if [[ ! -f "$START_EXAMPLE" ]]; then
+  echo "missing start example: $START_EXAMPLE" >&2
   exit 1
 fi
 
@@ -30,6 +40,9 @@ if command -v strip >/dev/null 2>&1; then
   strip "$STAGE/bin/zabbix-ctl" || true
 fi
 cp "$CFG_EXAMPLE" "$STAGE/config/zabbix-ctl.toml.example"
+cp "$ENV_EXAMPLE" "$STAGE/config/env.sh.example"
+cp "$START_EXAMPLE" "$STAGE/start.sh"
+chmod +x "$STAGE/start.sh"
 if [[ -f README.md ]]; then
   cp README.md "$STAGE/"
 fi
@@ -43,14 +56,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/zabbix-ctl
-ExecStart=/opt/zabbix-ctl/bin/zabbix-ctl
+ExecStart=/opt/zabbix-ctl/start.sh
 Restart=on-failure
 RestartSec=3
-# 敏感项用 Environment / EnvironmentFile，勿写入 toml
-# Environment=ZABBIX_CTL_SERVICE_TOKEN=
-# Environment=ZBX_TOKEN_DC1=
-# Environment=MERIDIANOPS_JOB_TOKEN=
-# EnvironmentFile=-/opt/zabbix-ctl/config/env
 
 [Install]
 WantedBy=multi-user.target
@@ -69,23 +77,30 @@ zabbix-ctl Linux / 麒麟包
 
 内容
   bin/zabbix-ctl
+  start.sh                         前台启动（会 source config/env.sh）
   config/zabbix-ctl.toml.example
-  systemd/zabbix-ctl.service
+  config/env.sh.example            环境变量示例（令牌）
+  systemd/zabbix-ctl.service       可选
 
-部署（银河麒麟 V10 SP3 示例）
+不用 systemd（推荐先这样测）
   1. tar xzf 本包 -C /opt && mv /opt/zabbix-ctl-* /opt/zabbix-ctl
-  2. cp config/zabbix-ctl.toml.example config/zabbix-ctl.toml 并改数据库、Zabbix API
-  3. 在 WorkingDirectory 下放 zabbix-ctl.toml，或设 ZABBIX_CTL_CONFIG
-  4. 导出 ZABBIX_CTL_SERVICE_TOKEN（与 Gateway MERIDIANOPS_ZABBIX_CTL_TOKEN 相同）
-     以及 ZBX_TOKEN_<CODE>（CODE 大写）
-  5. cp systemd/zabbix-ctl.service /etc/systemd/system/
-     systemctl daemon-reload && systemctl enable --now zabbix-ctl
+  2. cd /opt/zabbix-ctl
+  3. cp config/zabbix-ctl.toml.example zabbix-ctl.toml   # 改数据库、Zabbix API
+  4. cp config/env.sh.example config/env.sh && chmod 600 config/env.sh
+     编辑填 ZABBIX_CTL_SERVICE_TOKEN、ZBX_TOKEN_DC1
+  5. ./start.sh
+     或后台: nohup ./start.sh > zabbix-ctl.log 2>&1 &
   6. curl http://127.0.0.1:8090/health
+
+用 systemd（可选）
+  cp systemd/zabbix-ctl.service /etc/systemd/system/
+  systemctl daemon-reload && systemctl enable --now zabbix-ctl
 
 说明
   - 默认只监听 127.0.0.1:8090，仅给 Gateway 内网调用
   - 数据库连 MeridianOps 同一 MySQL（meridianops 库）
-  - 麒麟包在 hxsoong/kylin:v10-sp3 容器内编译
+  - Gateway 侧 MERIDIANOPS_ZABBIX_CTL_TOKEN 必须与 ZABBIX_CTL_SERVICE_TOKEN 相同
+  - 真实令牌只放 config/env.sh，不要提交仓库
 EOF
 
 mkdir -p dist

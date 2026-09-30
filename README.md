@@ -36,3 +36,15 @@ cargo run
 ```
 
 默认监听 `127.0.0.1:8090`。数据库连得上时会自动迁移并启动任务工人；连不上时只读接口仍可用。
+
+## 发布包部署（Linux / 麒麟）
+
+GitHub Actions 产物里已含 `start.sh` 与 `config/env.sh.example`：
+
+```bash
+cp config/zabbix-ctl.toml.example zabbix-ctl.toml   # 改库、Zabbix
+cp config/env.sh.example config/env.sh && chmod 600 config/env.sh
+# 编辑 env.sh 填令牌
+./start.sh
+# 或: nohup ./start.sh > zabbix-ctl.log 2>&1 &
+```

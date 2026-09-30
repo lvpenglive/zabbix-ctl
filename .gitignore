@@ -1,5 +1,7 @@
 /target
 zabbix-ctl.toml
+config/env.sh
+start.sh
 *.log
 .idea/
 .vscode/
