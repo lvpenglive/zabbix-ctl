@@ -30,9 +30,9 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| PathBuf::from("zabbix-ctl.toml"));
     let cfg = load(&path)?;
     let bind: SocketAddr = cfg.server.bind.parse()?;
-    let service_token = env::var("ZABBIX_CTL_SERVICE_TOKEN").unwrap_or_default();
+    let service_token = cfg.server.resolved_service_token();
     if service_token.is_empty() {
-        tracing::warn!("未设置 ZABBIX_CTL_SERVICE_TOKEN，除 /health 外的接口会拒绝访问");
+        tracing::warn!("未配置 service_token（toml [server] 或环境变量 ZABBIX_CTL_SERVICE_TOKEN），除 /health 外的接口会拒绝访问");
     }
 
     let db = match db::connect(&cfg.database).await {

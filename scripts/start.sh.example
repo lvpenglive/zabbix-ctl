@@ -1,20 +1,12 @@
 #!/bin/bash
-# 复制为 start.sh 后填写令牌，或先 source config/env.sh
+# 前台启动。令牌写在 zabbix-ctl.toml，无需再 export。
 set -euo pipefail
 cd "$(dirname "$0")"
-
-ENV_FILE="${ENV_FILE:-./config/env.sh}"
-if [[ -f "$ENV_FILE" ]]; then
-  # shellcheck source=/dev/null
-  source "$ENV_FILE"
-fi
-
-: "${ZABBIX_CTL_SERVICE_TOKEN:?请先设置 ZABBIX_CTL_SERVICE_TOKEN，或复制 config/env.sh.example 为 config/env.sh}"
 
 export ZABBIX_CTL_CONFIG="${ZABBIX_CTL_CONFIG:-$PWD/zabbix-ctl.toml}"
 if [[ ! -f "$ZABBIX_CTL_CONFIG" ]]; then
   echo "缺少配置文件: $ZABBIX_CTL_CONFIG" >&2
-  echo "请先: cp config/zabbix-ctl.toml.example zabbix-ctl.toml" >&2
+  echo "请先: cp config/zabbix-ctl.toml.example zabbix-ctl.toml 并填写令牌" >&2
   exit 1
 fi
 

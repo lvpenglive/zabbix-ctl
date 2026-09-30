@@ -10,7 +10,6 @@ cd "$ROOT"
 
 BIN="target/release/zabbix-ctl"
 CFG_EXAMPLE="zabbix-ctl.toml.example"
-ENV_EXAMPLE="config/env.sh.example"
 START_EXAMPLE="scripts/start.sh.example"
 
 if [[ ! -f "$BIN" ]]; then
@@ -19,10 +18,6 @@ if [[ ! -f "$BIN" ]]; then
 fi
 if [[ ! -f "$CFG_EXAMPLE" ]]; then
   echo "missing config example: $CFG_EXAMPLE" >&2
-  exit 1
-fi
-if [[ ! -f "$ENV_EXAMPLE" ]]; then
-  echo "missing env example: $ENV_EXAMPLE" >&2
   exit 1
 fi
 if [[ ! -f "$START_EXAMPLE" ]]; then
@@ -40,7 +35,6 @@ if command -v strip >/dev/null 2>&1; then
   strip "$STAGE/bin/zabbix-ctl" || true
 fi
 cp "$CFG_EXAMPLE" "$STAGE/config/zabbix-ctl.toml.example"
-cp "$ENV_EXAMPLE" "$STAGE/config/env.sh.example"
 cp "$START_EXAMPLE" "$STAGE/start.sh"
 chmod +x "$STAGE/start.sh"
 if [[ -f README.md ]]; then
@@ -77,30 +71,28 @@ zabbix-ctl Linux / 麒麟包
 
 内容
   bin/zabbix-ctl
-  start.sh                         前台启动（会 source config/env.sh）
+  start.sh
   config/zabbix-ctl.toml.example
-  config/env.sh.example            环境变量示例（令牌）
   systemd/zabbix-ctl.service       可选
 
-不用 systemd（推荐先这样测）
+部署（不用 systemd）
   1. tar xzf 本包 -C /opt && mv /opt/zabbix-ctl-* /opt/zabbix-ctl
   2. cd /opt/zabbix-ctl
-  3. cp config/zabbix-ctl.toml.example zabbix-ctl.toml   # 改数据库、Zabbix API
-  4. cp config/env.sh.example config/env.sh && chmod 600 config/env.sh
-     编辑填 ZABBIX_CTL_SERVICE_TOKEN、ZBX_TOKEN_DC1
+  3. cp config/zabbix-ctl.toml.example zabbix-ctl.toml
+     填写 [server].service_token、[[zabbix]].api_token、数据库等
+  4. chmod 600 zabbix-ctl.toml
   5. ./start.sh
      或后台: nohup ./start.sh > zabbix-ctl.log 2>&1 &
   6. curl http://127.0.0.1:8090/health
 
-用 systemd（可选）
-  cp systemd/zabbix-ctl.service /etc/systemd/system/
-  systemctl daemon-reload && systemctl enable --now zabbix-ctl
+Gateway
+  MERIDIANOPS_ZABBIX_CTL_TOKEN 必须与 toml 里 service_token 相同
+  [zabbix_ctl] base_url = "http://127.0.0.1:8090"
 
 说明
-  - 默认只监听 127.0.0.1:8090，仅给 Gateway 内网调用
+  - 默认只监听 127.0.0.1:8090
   - 数据库连 MeridianOps 同一 MySQL（meridianops 库）
-  - Gateway 侧 MERIDIANOPS_ZABBIX_CTL_TOKEN 必须与 ZABBIX_CTL_SERVICE_TOKEN 相同
-  - 真实令牌只放 config/env.sh，不要提交仓库
+  - 环境变量仍可覆盖令牌（可选）
 EOF
 
 mkdir -p dist

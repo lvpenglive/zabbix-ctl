@@ -5,7 +5,7 @@ use axum::http::request::Parts;
 use crate::error::AppError;
 use crate::state::AppState;
 
-/// Gateway 调用本服务时携带的服务令牌。来自环境变量 `ZABBIX_CTL_SERVICE_TOKEN`。
+/// Gateway 调用本服务时携带的服务令牌（toml `[server].service_token`，可用环境变量覆盖）。
 pub struct ServiceAuth;
 
 #[async_trait]

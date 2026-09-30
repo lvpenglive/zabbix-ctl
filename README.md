@@ -15,36 +15,36 @@ Zabbix 纳管后端。只提供接口，没有页面。值班人员从 MeridianO
 - `POST /api/tasks` 创建启停/升级任务
 - `GET /api/tasks/:id` 查看任务与每台结果
 
-除 `/health` 外都要带 `Authorization: Bearer <ZABBIX_CTL_SERVICE_TOKEN>`。
+除 `/health` 外都要带 `Authorization: Bearer <service_token>`。
 
-## 环境变量
+## 配置（`zabbix-ctl.toml`）
 
-| 变量 | 作用 |
+令牌直接写在 toml 里即可：
+
+| 字段 | 作用 |
 |------|------|
-| `ZABBIX_CTL_SERVICE_TOKEN` | Gateway 调本服务 |
-| `ZBX_TOKEN_{CODE}` | Zabbix API 令牌 |
-| `MERIDIANOPS_JOB_TOKEN` | 调 Gateway 作业的 API Token（`mk-` 前缀） |
-| `MERIDIANOPS_DB_URL` | 覆盖数据库连接 |
+| `[server].service_token` | Gateway 调本服务（与 `MERIDIANOPS_ZABBIX_CTL_TOKEN` 相同） |
+| `[[zabbix]].api_token` | 该实例的 Zabbix API 令牌 |
+| `[meridianops].job_token` | 调 Gateway 作业的 `mk-` 令牌（启停时需要） |
 
-`MERIDIANOPS_ZABBIX_CTL_TOKEN`（Gateway 侧）必须与 `ZABBIX_CTL_SERVICE_TOKEN` 相同。
+可选环境变量覆盖：`ZABBIX_CTL_SERVICE_TOKEN`、`ZBX_TOKEN_{CODE}`、`MERIDIANOPS_JOB_TOKEN`、`MERIDIANOPS_DB_URL`。
 
 ## 运行
 
 ```bash
-copy zabbix-ctl.toml.example zabbix-ctl.toml
+cp zabbix-ctl.toml.example zabbix-ctl.toml
+# 编辑填写 service_token / api_token / 数据库
 cargo run
 ```
 
-默认监听 `127.0.0.1:8090`。数据库连得上时会自动迁移并启动任务工人；连不上时只读接口仍可用。
+默认监听 `127.0.0.1:8090`。
 
 ## 发布包部署（Linux / 麒麟）
 
-GitHub Actions 产物里已含 `start.sh` 与 `config/env.sh.example`：
-
 ```bash
-cp config/zabbix-ctl.toml.example zabbix-ctl.toml   # 改库、Zabbix
-cp config/env.sh.example config/env.sh && chmod 600 config/env.sh
-# 编辑 env.sh 填令牌
+cp config/zabbix-ctl.toml.example zabbix-ctl.toml
+# 编辑令牌与数据库
+chmod 600 zabbix-ctl.toml
 ./start.sh
 # 或: nohup ./start.sh > zabbix-ctl.log 2>&1 &
 ```

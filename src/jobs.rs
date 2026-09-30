@@ -15,8 +15,9 @@ pub struct JobClient {
 
 impl JobClient {
     pub fn from_config(http: reqwest::Client, cfg: &MeridianOpsConfig) -> Result<Self, AppError> {
-        let token = MeridianOpsConfig::job_token_from_env()
-            .ok_or_else(|| AppError::bad("未配置环境变量 MERIDIANOPS_JOB_TOKEN"))?;
+        let token = cfg.resolved_job_token().ok_or_else(|| {
+            AppError::bad("未配置作业令牌（toml [meridianops].job_token 或环境变量 MERIDIANOPS_JOB_TOKEN）")
+        })?;
         Ok(Self {
             http,
             base_url: cfg.base_url.trim_end_matches('/').to_string(),

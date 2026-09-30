@@ -19,10 +19,22 @@ pub struct AppConfig {
 pub struct ServerConfig {
     #[serde(default = "default_bind")]
     pub bind: String,
+    /// Gateway 调用本服务时使用的 Bearer。环境变量 ZABBIX_CTL_SERVICE_TOKEN 可覆盖。
+    #[serde(default)]
+    pub service_token: String,
 }
 
 fn default_bind() -> String {
     "127.0.0.1:8090".to_string()
+}
+
+impl ServerConfig {
+    pub fn resolved_service_token(&self) -> String {
+        env::var("ZABBIX_CTL_SERVICE_TOKEN")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| self.service_token.clone())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -45,6 +57,8 @@ impl Default for DatabaseConfig {
 #[serde(default)]
 pub struct MeridianOpsConfig {
     pub base_url: String,
+    /// 调 Gateway 作业接口的 API Token（mk- 前缀）。环境变量 MERIDIANOPS_JOB_TOKEN 可覆盖。
+    pub job_token: String,
     pub job_start: i64,
     pub job_stop: i64,
     pub job_restart: i64,
@@ -61,7 +75,8 @@ pub struct MeridianOpsConfig {
 impl Default for MeridianOpsConfig {
     fn default() -> Self {
         Self {
-            base_url: "http://127.0.0.1:8000".to_string(),
+            base_url: "http://127.0.0.1:8800".to_string(),
+            job_token: String::new(),
             job_start: 0,
             job_stop: 0,
             job_restart: 0,
@@ -109,10 +124,17 @@ impl MeridianOpsConfig {
         }
     }
 
-    pub fn job_token_from_env() -> Option<String> {
+    pub fn resolved_job_token(&self) -> Option<String> {
         env::var("MERIDIANOPS_JOB_TOKEN")
             .ok()
             .filter(|v| !v.is_empty())
+            .or_else(|| {
+                if self.job_token.is_empty() {
+                    None
+                } else {
+                    Some(self.job_token.clone())
+                }
+            })
     }
 }
 
@@ -121,6 +143,9 @@ pub struct ZabbixInstanceConfig {
     pub code: String,
     pub name: String,
     pub api_url: String,
+    /// Zabbix API 令牌。环境变量 ZBX_TOKEN_{CODE} 可覆盖。
+    #[serde(default)]
+    pub api_token: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// 标准模板名称列表。主机缺少其中任一则记为偏离。为空则只列出模板、不判偏离。
@@ -151,8 +176,17 @@ impl ZabbixInstanceConfig {
         format!("ZBX_TOKEN_{}", self.code.to_uppercase())
     }
 
-    pub fn token_from_env(&self) -> Option<String> {
-        env::var(self.token_env_key()).ok().filter(|v| !v.is_empty())
+    pub fn resolved_api_token(&self) -> Option<String> {
+        env::var(self.token_env_key())
+            .ok()
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                if self.api_token.is_empty() {
+                    None
+                } else {
+                    Some(self.api_token.clone())
+                }
+            })
     }
 }
 

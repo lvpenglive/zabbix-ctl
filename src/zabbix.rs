@@ -26,8 +26,11 @@ pub struct ZabbixClient {
 
 impl ZabbixClient {
     pub fn new(http: reqwest::Client, instance: ZabbixInstanceConfig) -> Result<Self, AppError> {
-        let token = instance.token_from_env().ok_or_else(|| {
-            AppError::bad(format!("未配置环境变量 {}", instance.token_env_key()))
+        let token = instance.resolved_api_token().ok_or_else(|| {
+            AppError::bad(format!(
+                "未配置 Zabbix API 令牌（toml [[zabbix]].api_token 或环境变量 {}）",
+                instance.token_env_key()
+            ))
         })?;
         Ok(Self {
             http,

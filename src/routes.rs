@@ -53,7 +53,7 @@ async fn list_instances(
             json!({
                 "code": z.code,
                 "name": z.name,
-                "tokenConfigured": z.token_from_env().is_some(),
+                "tokenConfigured": z.resolved_api_token().is_some(),
             })
         })
         .collect();
