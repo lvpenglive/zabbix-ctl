@@ -40,35 +40,44 @@ jobs:
           path: dist/zabbix-ctl-linux-x86_64.tar.gz
           if-no-files-found: error
 
-  # GitHub 无官方麒麟 runner：在社区 Kylin V10 SP3 容器内编译，
-  # 贴近银河麒麟高级服务器操作系统 V10 SP3。
-  kylin-v10-sp3-x86_64:
-    name: Kylin V10 SP3 x86_64
+  kylin-x86_64:
+    name: ${{ matrix.label }}
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image_tag: v10-sp1
+            package: zabbix-ctl-kylin-v10-sp1-x86_64
+            label: Kylin V10 SP1 x86_64
+          - image_tag: v10-sp3
+            package: zabbix-ctl-kylin-v10-sp3-x86_64
+            label: Kylin V10 SP3 x86_64
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/cache@v4
         with:
           path: |
-            .cargo-kylin
-            .rustup-kylin
+            .cargo-kylin-${{ matrix.image_tag }}
+            .rustup-kylin-${{ matrix.image_tag }}
             target
-          key: kylin-v10-sp3-${{ hashFiles('Cargo.lock') }}
+          key: kylin-${{ matrix.image_tag }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            kylin-v10-sp3-
+            kylin-${{ matrix.image_tag }}-
 
-      - name: Build inside Kylin V10 SP3 container
+      - name: Build inside Kylin ${{ matrix.image_tag }} container
         run: |
           set -euo pipefail
-          docker pull hxsoong/kylin:v10-sp3
+          IMAGE="hxsoong/kylin:${{ matrix.image_tag }}"
+          docker pull "$IMAGE"
           docker run --rm \
             -v "$PWD:/workspace" \
             -w /workspace \
-            -e CARGO_HOME=/workspace/.cargo-kylin \
-            -e RUSTUP_HOME=/workspace/.rustup-kylin \
-            hxsoong/kylin:v10-sp3 \
+            -e CARGO_HOME=/workspace/.cargo-kylin-${{ matrix.image_tag }} \
+            -e RUSTUP_HOME=/workspace/.rustup-kylin-${{ matrix.image_tag }} \
+            "$IMAGE" \
             bash -lc '
               set -euo pipefail
               cat /etc/.productinfo 2>/dev/null || true
@@ -93,19 +102,19 @@ jobs:
 
       - name: Stage package
         env:
-          PACKAGE_NAME: zabbix-ctl-kylin-v10-sp3-x86_64
-          PACKAGE_LABEL: Kylin V10 SP3 x86_64 (built in hxsoong/kylin:v10-sp3)
+          PACKAGE_NAME: ${{ matrix.package }}
+          PACKAGE_LABEL: ${{ matrix.label }} (built in hxsoong/kylin:${{ matrix.image_tag }})
         run: bash .github/scripts/package-linux.sh
 
       - uses: actions/upload-artifact@v4
         with:
-          name: zabbix-ctl-kylin-v10-sp3-x86_64
-          path: dist/zabbix-ctl-kylin-v10-sp3-x86_64.tar.gz
+          name: ${{ matrix.package }}
+          path: dist/${{ matrix.package }}.tar.gz
           if-no-files-found: error
 
   release:
     name: Attach release assets
-    needs: [linux-x86_64, kylin-v10-sp3-x86_64]
+    needs: [linux-x86_64, kylin-x86_64]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
@@ -123,6 +132,7 @@ jobs:
         with:
           files: |
             dist/zabbix-ctl-linux-x86_64.tar.gz
+            dist/zabbix-ctl-kylin-v10-sp1-x86_64.tar.gz
             dist/zabbix-ctl-kylin-v10-sp3-x86_64.tar.gz
           generate_release_notes: true
         env:
