@@ -146,6 +146,9 @@ pub struct ZabbixInstanceConfig {
     /// Zabbix API 令牌。环境变量 ZBX_TOKEN_{CODE} 可覆盖。
     #[serde(default)]
     pub api_token: String,
+    /// 鉴权方式：`auto`（默认，按版本选择）、`header`（Bearer）、`body`（JSON auth，适合 7.0 及反代剥 Header）。
+    #[serde(default = "default_api_auth")]
+    pub api_auth: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// 标准模板名称列表。主机缺少其中任一则记为偏离。为空则只列出模板、不判偏离。
@@ -161,6 +164,10 @@ pub struct ZabbixInstanceConfig {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_api_auth() -> String {
+    "auto".to_string()
 }
 
 fn default_proxy_stale_secs() -> i64 {

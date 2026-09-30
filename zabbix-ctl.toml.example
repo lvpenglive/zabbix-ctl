@@ -31,6 +31,8 @@ code = "dc1"
 name = "主机房 Zabbix"
 api_url = "https://zabbix.example/api_jsonrpc.php"
 api_token = "change-me"
+# 鉴权：auto（默认，7.0.x 会走 body auth）/ header（Bearer）/ body（JSON auth）
+api_auth = "auto"
 enabled = true
 # 标准模板名。主机缺少其中任一则在治理页标为偏离；留空则只展示已挂模板。
 standard_templates = ["Linux by Zabbix agent"]

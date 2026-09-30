@@ -1,5 +1,7 @@
 //! Zabbix JSON-RPC 客户端。历史数据仍留在 Zabbix，这里只现查。
 
+use std::sync::OnceLock;
+
 use serde_json::{json, Value};
 
 use crate::config::ZabbixInstanceConfig;
@@ -18,10 +20,19 @@ const ITEM_KEYS: &[&str] = &[
     "vfs.fs.size[/,pused]",
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthMode {
+    /// Authorization: Bearer（Zabbix 6.4+ 推荐，7.2+ 唯一）
+    Header,
+    /// JSON-RPC body 的 auth 字段（7.2 以下可用；反代剥 Header 时必需）
+    Body,
+}
+
 pub struct ZabbixClient {
     http: reqwest::Client,
     instance: ZabbixInstanceConfig,
     token: String,
+    auth_mode: OnceLock<AuthMode>,
 }
 
 impl ZabbixClient {
@@ -36,6 +47,7 @@ impl ZabbixClient {
             http,
             instance,
             token,
+            auth_mode: OnceLock::new(),
         })
     }
 
@@ -441,17 +453,43 @@ impl ZabbixClient {
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value, AppError> {
-        let body = json!({
+        let needs_auth = method != "apiinfo.version";
+        let auth = if needs_auth {
+            Some(self.resolve_auth_mode().await?)
+        } else {
+            None
+        };
+        self.call_with_auth(method, params, auth).await
+    }
+
+    async fn call_with_auth(
+        &self,
+        method: &str,
+        params: Value,
+        auth: Option<AuthMode>,
+    ) -> Result<Value, AppError> {
+        let mut body = json!({
             "jsonrpc": "2.0",
             "method": method,
             "params": params,
             "id": 1,
         });
-        let response = self
+        let mut request = self
             .http
             .post(&self.instance.api_url)
-            .header("Authorization", format!("Bearer {}", self.token))
-            .header("Content-Type", "application/json")
+            .header("Content-Type", "application/json");
+
+        match auth {
+            Some(AuthMode::Header) => {
+                request = request.header("Authorization", format!("Bearer {}", self.token));
+            }
+            Some(AuthMode::Body) => {
+                body["auth"] = json!(self.token);
+            }
+            None => {}
+        }
+
+        let response = request
             .json(&body)
             .send()
             .await
@@ -471,6 +509,40 @@ impl ZabbixClient {
         }
         Ok(payload.get("result").cloned().unwrap_or(Value::Null))
     }
+
+    async fn resolve_auth_mode(&self) -> Result<AuthMode, AppError> {
+        if let Some(mode) = self.auth_mode.get() {
+            return Ok(*mode);
+        }
+        let mode = match self.instance.api_auth.trim().to_ascii_lowercase().as_str() {
+            "header" | "bearer" => AuthMode::Header,
+            "body" | "auth" => AuthMode::Body,
+            _ => {
+                // auto：无鉴权取版本；7.2 以下用 body auth（兼容反代剥 Header）
+                let ver = self
+                    .call_with_auth("apiinfo.version", json!({}), None)
+                    .await?;
+                let ver = ver.as_str().unwrap_or("");
+                if zabbix_version_lt_7_2(ver) {
+                    tracing::info!(version = ver, "Zabbix < 7.2，API 鉴权使用 body auth");
+                    AuthMode::Body
+                } else {
+                    tracing::info!(version = ver, "Zabbix >= 7.2，API 鉴权使用 Authorization Bearer");
+                    AuthMode::Header
+                }
+            }
+        };
+        let _ = self.auth_mode.set(mode);
+        Ok(mode)
+    }
+}
+
+/// 解析 x.y.z；无法解析时当作旧版，走 body auth。
+fn zabbix_version_lt_7_2(version: &str) -> bool {
+    let mut parts = version.split('.');
+    let major = parts.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+    let minor = parts.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+    major < 7 || (major == 7 && minor < 2)
 }
 
 fn map_host(host: &Value, items: &[Value]) -> Value {
