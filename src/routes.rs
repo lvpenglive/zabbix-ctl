@@ -5,6 +5,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::auth::ServiceAuth;
+use crate::designer;
 use crate::error::AppError;
 use crate::state::AppState;
 use crate::worker;
@@ -26,8 +27,47 @@ pub fn router() -> Router<AppState> {
         )
         .route("/api/instances/:code/sync", post(sync_hosts))
         .route("/api/instances/:code/governance", get(governance))
+        .route(
+            "/api/instances/:code/template-groups",
+            get(template_groups).post(designer::create_template_group),
+        )
+        .route(
+            "/api/instances/:code/host-groups",
+            get(host_groups).post(designer::create_host_group),
+        )
+        .route(
+            "/api/instances/:code/host-groups/:group_id/hosts",
+            get(host_group_hosts),
+        )
+        .route(
+            "/api/instances/:code/templates",
+            get(templates).post(designer::create_template),
+        )
+        .route(
+            "/api/instances/:code/hosts/:host_id/linkage",
+            get(host_linkage),
+        )
+        .route(
+            "/api/instances/:code/hosts/:host_id/templates",
+            post(link_templates),
+        )
+        .route(
+            "/api/instances/:code/hosts/:host_id/groups",
+            post(link_groups),
+        )
+        .route(
+            "/api/instances/:code/hosts/:host_id/macros",
+            get(host_macros).put(save_host_macros),
+        )
+        .route("/api/instances/:code/hosts", post(register_host))
+        .route("/api/instances/:code/events/:event_id", get(event_hosts))
+        .route(
+            "/api/instances/:code/events/:event_id/ack",
+            post(ack_event),
+        )
         .route("/api/tasks", post(create_task))
         .route("/api/tasks/:id", get(get_task))
+        .merge(designer::routes())
 }
 
 async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -54,6 +94,7 @@ async fn list_instances(
                 "code": z.code,
                 "name": z.name,
                 "tokenConfigured": z.resolved_api_token().is_some(),
+                "protected": z.protected,
             })
         })
         .collect();
@@ -194,10 +235,19 @@ async fn governance(
 struct CreateTaskRequest {
     instance_code: String,
     action: String,
+    #[serde(default)]
     host_ids: Vec<String>,
     target_version: Option<String>,
     concurrency: Option<i32>,
     requested_by: Option<String>,
+    #[serde(default)]
+    ci_ids: Vec<String>,
+    #[serde(default)]
+    group_ids: Vec<String>,
+    #[serde(default)]
+    template_ids: Vec<String>,
+    server: Option<String>,
+    server_active: Option<String>,
 }
 
 async fn create_task(
@@ -209,17 +259,35 @@ async fn create_task(
         .db
         .as_ref()
         .ok_or_else(|| AppError::bad("数据库未配置，无法创建任务"))?;
-    let id = worker::create_task(
-        pool,
-        &state.config,
-        &req.instance_code,
-        &req.action,
-        &req.host_ids,
-        req.target_version.as_deref(),
-        req.concurrency.unwrap_or(10),
-        req.requested_by.as_deref().unwrap_or(""),
-    )
-    .await
+    let requested_by = req.requested_by.as_deref().unwrap_or("");
+    let concurrency = req.concurrency.unwrap_or(10);
+    let id = if req.action == "install" {
+        worker::create_install_task(
+            pool,
+            &state.config,
+            &req.instance_code,
+            &req.ci_ids,
+            &req.group_ids,
+            &req.template_ids,
+            req.server.as_deref().unwrap_or(""),
+            req.server_active.as_deref().unwrap_or(""),
+            concurrency,
+            requested_by,
+        )
+        .await
+    } else {
+        worker::create_task(
+            pool,
+            &state.config,
+            &req.instance_code,
+            &req.action,
+            &req.host_ids,
+            req.target_version.as_deref(),
+            concurrency,
+            requested_by,
+        )
+        .await
+    }
     .map_err(|e| AppError::bad(e.to_string()))?;
     Ok(Json(json!({ "code": 0, "data": { "id": id } })))
 }
@@ -238,6 +306,168 @@ async fn get_task(
         .map_err(|e| AppError::internal(e.to_string()))?
         .ok_or_else(|| AppError::NotFound(format!("任务不存在: {id}")))?;
     Ok(Json(json!({ "code": 0, "data": task })))
+}
+
+#[derive(Debug, Deserialize)]
+struct TemplateQuery {
+    #[serde(rename = "groupId")]
+    group_id: Option<String>,
+}
+
+async fn template_groups(
+    State(state): State<AppState>,
+    _auth: ServiceAuth,
+    Path(code): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let items = client_for(&state, &code)?.list_template_groups().await?;
+    Ok(Json(json!({ "code": 0, "data": items })))
+}
+
+async fn host_groups(
+    State(state): State<AppState>,
+    _auth: ServiceAuth,
+    Path(code): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let items = client_for(&state, &code)?.list_host_groups().await?;
+    Ok(Json(json!({ "code": 0, "data": items })))
+}
+
+async fn host_group_hosts(
+    State(state): State<AppState>,
+    _auth: ServiceAuth,
+    Path((code, group_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let items = client_for(&state, &code)?.hosts_in_group(&group_id).await?;
+    Ok(Json(json!({ "code": 0, "data": items })))
+}
+
+async fn templates(
+    State(state): State<AppState>,
+    _auth: ServiceAuth,
+    Path(code): Path<String>,
+    Query(q): Query<TemplateQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let items = client_for(&state, &code)?
+        .list_templates(q.group_id.as_deref())
+        .await?;
+    Ok(Json(json!({ "code": 0, "data": items })))
+}
+
+async fn host_linkage(
+    State(state): State<AppState>,
+    _auth: ServiceAuth,
+    Path((code, host_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let data = client_for(&state, &code)?.host_linkage(&host_id).await?;
+    Ok(Json(json!({ "code": 0, "data": data })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LinkRequest {
+    action: String,
+    template_ids: Option<Vec<String>>,
+    group_ids: Option<Vec<String>>,
+}
+
+async fn link_templates(
+    State(state): State<AppState>,
+    _auth: ServiceAuth,
+    Path((code, host_id)): Path<(String, String)>,
+    Json(req): Json<LinkRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let data = client_for_write(&state, &code)?
+        .link_templates(
+            &host_id,
+            req.template_ids.as_deref().unwrap_or(&[]),
+            &req.action,
+        )
+        .await?;
+    Ok(Json(json!({ "code": 0, "data": data })))
+}
+
+async fn link_groups(
+    State(state): State<AppState>,
+    _auth: ServiceAuth,
+    Path((code, host_id)): Path<(String, String)>,
+    Json(req): Json<LinkRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let data = client_for_write(&state, &code)?
+        .link_groups(
+            &host_id,
+            req.group_ids.as_deref().unwrap_or(&[]),
+            &req.action,
+        )
+        .await?;
+    Ok(Json(json!({ "code": 0, "data": data })))
+}
+
+async fn host_macros(
+    State(state): State<AppState>,
+    _auth: ServiceAuth,
+    Path((code, host_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let items = client_for(&state, &code)?.host_macros(&host_id).await?;
+    Ok(Json(json!({ "code": 0, "data": items })))
+}
+
+#[derive(Debug, Deserialize)]
+struct MacroListRequest {
+    macros: Vec<serde_json::Value>,
+}
+
+async fn save_host_macros(
+    State(state): State<AppState>,
+    _auth: ServiceAuth,
+    Path((code, host_id)): Path<(String, String)>,
+    Json(req): Json<MacroListRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let items = client_for_write(&state, &code)?
+        .save_host_macros(&host_id, &req.macros)
+        .await?;
+    Ok(Json(json!({ "code": 0, "data": items })))
+}
+
+async fn register_host(
+    State(state): State<AppState>,
+    _auth: ServiceAuth,
+    Path(code): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let data = client_for_write(&state, &code)?.register_host(&body).await?;
+    Ok(Json(json!({ "code": 0, "data": data })))
+}
+
+async fn event_hosts(
+    State(state): State<AppState>,
+    _auth: ServiceAuth,
+    Path((code, event_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let host_ids = client_for(&state, &code)?.event_hosts(&event_id).await?;
+    Ok(Json(json!({ "code": 0, "data": { "hostIds": host_ids } })))
+}
+
+async fn ack_event(
+    State(state): State<AppState>,
+    _auth: ServiceAuth,
+    Path((code, event_id)): Path<(String, String)>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let data = client_for_write(&state, &code)?
+        .acknowledge_event(&event_id, &body)
+        .await?;
+    Ok(Json(json!({ "code": 0, "data": data })))
+}
+
+fn client_for_write(state: &AppState, code: &str) -> Result<ZabbixClient, AppError> {
+    let instance = state
+        .config
+        .zabbix
+        .iter()
+        .find(|z| z.enabled && z.code == code)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(format!("未找到 Zabbix 实例 {code}")))?;
+    ZabbixClient::for_write(state.http.clone(), instance)
 }
 
 fn client_for(state: &AppState, code: &str) -> Result<ZabbixClient, AppError> {

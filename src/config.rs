@@ -64,12 +64,20 @@ pub struct MeridianOpsConfig {
     pub job_restart: i64,
     pub job_upgrade: i64,
     pub job_rollback: i64,
+    #[serde(default)]
+    pub job_install: i64,
     /// 为 0 时按名称从 job_definitions 解析
     pub job_start_name: String,
     pub job_stop_name: String,
     pub job_restart_name: String,
     pub job_upgrade_name: String,
     pub job_rollback_name: String,
+    #[serde(default = "default_install_job_name")]
+    pub job_install_name: String,
+}
+
+fn default_install_job_name() -> String {
+    "Zabbix Agent 安装".to_string()
 }
 
 impl Default for MeridianOpsConfig {
@@ -82,11 +90,13 @@ impl Default for MeridianOpsConfig {
             job_restart: 0,
             job_upgrade: 0,
             job_rollback: 0,
+            job_install: 0,
             job_start_name: "Zabbix Agent 启动".to_string(),
             job_stop_name: "Zabbix Agent 停止".to_string(),
             job_restart_name: "Zabbix Agent 重启".to_string(),
             job_upgrade_name: "Zabbix Agent 升级".to_string(),
             job_rollback_name: "Zabbix Agent 回滚".to_string(),
+            job_install_name: default_install_job_name(),
         }
     }
 }
@@ -99,6 +109,7 @@ impl MeridianOpsConfig {
             "restart" => self.job_restart,
             "upgrade" => self.job_upgrade,
             "rollback" => self.job_rollback,
+            "install" => self.job_install,
             _ => 0,
         };
         if id > 0 {
@@ -115,6 +126,7 @@ impl MeridianOpsConfig {
             "restart" => self.job_restart_name.as_str(),
             "upgrade" => self.job_upgrade_name.as_str(),
             "rollback" => self.job_rollback_name.as_str(),
+            "install" => self.job_install_name.as_str(),
             _ => "",
         };
         if name.is_empty() {
@@ -146,11 +158,18 @@ pub struct ZabbixInstanceConfig {
     /// Zabbix API 令牌。环境变量 ZBX_TOKEN_{CODE} 可覆盖。
     #[serde(default)]
     pub api_token: String,
+    /// 改主机、模板关联、宏、确认问题用的写令牌。环境变量 ZBX_TOKEN_{CODE}_WRITE 可覆盖。
+    /// 为空时回退到读令牌，便于现有单令牌环境先跑起来。
+    #[serde(default)]
+    pub api_token_write: String,
     /// 鉴权方式：`auto`（默认，按版本选择）、`header`（Bearer）、`body`（JSON auth，适合 7.0 及反代剥 Header）。
     #[serde(default = "default_api_auth")]
     pub api_auth: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// 生产实例。为 true 时，模板设计器写入必须带已审批标记。
+    #[serde(default)]
+    pub protected: bool,
     /// 标准模板名称列表。主机缺少其中任一则记为偏离。为空则只列出模板、不判偏离。
     #[serde(default)]
     pub standard_templates: Vec<String>,
@@ -194,6 +213,25 @@ impl ZabbixInstanceConfig {
                     Some(self.api_token.clone())
                 }
             })
+    }
+
+    pub fn write_token_env_key(&self) -> String {
+        format!("ZBX_TOKEN_{}_WRITE", self.code.to_uppercase())
+    }
+
+    /// 写操作优先用写令牌，未配置时回退读令牌。
+    pub fn resolved_write_token(&self) -> Option<String> {
+        env::var(self.write_token_env_key())
+            .ok()
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                if self.api_token_write.is_empty() {
+                    None
+                } else {
+                    Some(self.api_token_write.clone())
+                }
+            })
+            .or_else(|| self.resolved_api_token())
     }
 }
 

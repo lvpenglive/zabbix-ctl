@@ -20,20 +20,26 @@ job_stop = 0
 job_restart = 0
 job_upgrade = 0
 job_rollback = 0
+job_install = 0
 job_start_name = "Zabbix Agent 启动"
 job_stop_name = "Zabbix Agent 停止"
 job_restart_name = "Zabbix Agent 重启"
 job_upgrade_name = "Zabbix Agent 升级"
 job_rollback_name = "Zabbix Agent 回滚"
+job_install_name = "Zabbix Agent 安装"
 
 [[zabbix]]
 code = "dc1"
 name = "主机房 Zabbix"
 api_url = "https://zabbix.example/api_jsonrpc.php"
 api_token = "change-me"
+# 写令牌。留空则写操作回退到 api_token。也可用环境变量 ZBX_TOKEN_DC1_WRITE。
+api_token_write = ""
 # 鉴权：auto（默认，7.0.x 会走 body auth）/ header（Bearer）/ body（JSON auth）
 api_auth = "auto"
 enabled = true
+# 生产实例设为 true：模板、监控项、触发器的写入必须先走变更工单，关闭后再执行。
+protected = false
 # 标准模板名。主机缺少其中任一则在治理页标为偏离；留空则只展示已挂模板。
 standard_templates = ["Linux by Zabbix agent"]
 proxy_stale_secs = 600

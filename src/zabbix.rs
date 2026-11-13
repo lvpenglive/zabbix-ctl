@@ -71,6 +71,7 @@ impl ZabbixClient {
         let mut params = json!({
             "output": ["hostid", "host", "name", "status"],
             "selectInterfaces": ["ip", "dns", "type", "main", "available"],
+            "selectHostGroups": ["groupid", "name"],
             "filter": { "status": 0 },
             "sortfield": "host",
         });
@@ -260,6 +261,30 @@ impl ZabbixClient {
     pub async fn agent_version(&self, host_id: &str) -> Result<Option<String>, AppError> {
         let items = self.items_for_hosts(&[host_id.to_string()]).await?;
         Ok(last_value(&items, host_id, &["agent.version"]))
+    }
+
+    pub async fn agent_ping_up(&self, host_id: &str) -> Result<bool, AppError> {
+        let items = self.items_for_hosts(&[host_id.to_string()]).await?;
+        Ok(last_value(&items, host_id, &["agent.ping"]).as_deref() == Some("1"))
+    }
+
+    pub async fn find_existing_host(&self, hostname: &str, ip: &str) -> Result<Option<String>, AppError> {
+        let by_name = if hostname.is_empty() {
+            None
+        } else {
+            self.find_host_id_by_name(hostname).await?
+        };
+        let by_ip = if ip.is_empty() {
+            None
+        } else {
+            self.find_host_id_by_ip(ip).await?
+        };
+        if let (Some(a), Some(b)) = (&by_name, &by_ip) {
+            if a != b {
+                return Err(AppError::bad("同名主机与同 IP 主机不是同一台"));
+            }
+        }
+        Ok(by_name.or(by_ip))
     }
 
     /// 创建主机维护期。返回 maintenanceid。
@@ -510,7 +535,408 @@ impl ZabbixClient {
         }))
     }
 
-    async fn call(&self, method: &str, params: Value) -> Result<Value, AppError> {
+    pub fn for_write(http: reqwest::Client, instance: ZabbixInstanceConfig) -> Result<Self, AppError> {
+        let token = instance.resolved_write_token().ok_or_else(|| {
+            AppError::bad(format!(
+                "未配置 Zabbix 写令牌（toml [[zabbix]].api_token_write 或环境变量 {}）",
+                instance.write_token_env_key()
+            ))
+        })?;
+        Ok(Self {
+            http,
+            instance,
+            token,
+            auth_mode: OnceLock::new(),
+        })
+    }
+
+    pub async fn list_template_groups(&self) -> Result<Vec<Value>, AppError> {
+        let result = self
+            .call(
+                "templategroup.get",
+                json!({
+                    "output": ["groupid", "name"],
+                    "sortfield": "name",
+                }),
+            )
+            .await?;
+        Ok(map_id_names(&result, "groupid", "groupId"))
+    }
+
+    pub async fn list_host_groups(&self) -> Result<Vec<Value>, AppError> {
+        let result = self
+            .call(
+                "hostgroup.get",
+                json!({
+                    "output": ["groupid", "name"],
+                    "sortfield": "name",
+                }),
+            )
+            .await?;
+        Ok(map_id_names(&result, "groupid", "groupId"))
+    }
+
+    pub async fn hosts_in_group(&self, group_id: &str) -> Result<Vec<Value>, AppError> {
+        require_zbx_id(group_id)?;
+        let result = self
+            .call(
+                "host.get",
+                json!({
+                    "output": ["hostid", "host", "name"],
+                    "groupids": [group_id],
+                    "selectInterfaces": ["ip", "dns", "type", "main"],
+                    "selectHostGroups": ["groupid", "name"],
+                    "filter": { "status": 0 },
+                    "sortfield": "host",
+                }),
+            )
+            .await?;
+        let hosts = result.as_array().cloned().unwrap_or_default();
+        Ok(hosts
+            .iter()
+            .map(|h| {
+                json!({
+                    "hostId": h["hostid"].as_str().unwrap_or(""),
+                    "hostname": h["host"].as_str().unwrap_or(""),
+                    "displayName": h["name"].as_str().unwrap_or(""),
+                    "ip": primary_ip(h),
+                    "groups": map_id_names(&h["hostgroups"], "groupid", "groupId"),
+                })
+            })
+            .collect())
+    }
+
+    pub async fn list_templates(&self, group_id: Option<&str>) -> Result<Vec<Value>, AppError> {
+        let mut params = json!({
+            "output": ["templateid", "host", "name"],
+            "selectTemplateGroups": ["groupid", "name"],
+            "selectParentTemplates": ["templateid", "name"],
+            "sortfield": "name",
+        });
+        if let Some(gid) = group_id.map(str::trim).filter(|s| !s.is_empty()) {
+            require_zbx_id(gid)?;
+            params["groupids"] = json!([gid]);
+        }
+        let result = self.call("template.get", params).await?;
+        Ok(result
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(map_template)
+            .collect())
+    }
+
+    pub async fn host_linkage(&self, host_id: &str) -> Result<Value, AppError> {
+        self.ensure_host(host_id).await?;
+        let result = self
+            .call(
+                "host.get",
+                json!({
+                    "output": ["hostid"],
+                    "hostids": [host_id],
+                    "selectHostGroups": ["groupid", "name"],
+                    "selectParentTemplates": ["templateid", "name"],
+                }),
+            )
+            .await?;
+        let host = result
+            .as_array()
+            .and_then(|a| a.first())
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        Ok(json!({
+            "groups": map_id_names(&host["hostgroups"], "groupid", "groupId"),
+            "templates": map_id_names(&host["parentTemplates"], "templateid", "templateId"),
+        }))
+    }
+
+    pub async fn link_templates(
+        &self,
+        host_id: &str,
+        template_ids: &[String],
+        action: &str,
+    ) -> Result<Value, AppError> {
+        self.ensure_host(host_id).await?;
+        for id in template_ids {
+            require_zbx_id(id)?;
+        }
+        if template_ids.is_empty() {
+            return Err(AppError::bad("模板列表为空"));
+        }
+        let linkage = self.host_linkage(host_id).await?;
+        let mut ids = ids_of(&linkage["templates"], "templateId");
+        apply_link(&mut ids, template_ids, action)?;
+        self.call(
+            "host.update",
+            json!({
+                "hostid": host_id,
+                "templates": ids.iter().map(|id| json!({"templateid": id})).collect::<Vec<_>>(),
+            }),
+        )
+        .await?;
+        self.host_linkage(host_id).await
+    }
+
+    pub async fn link_groups(
+        &self,
+        host_id: &str,
+        group_ids: &[String],
+        action: &str,
+    ) -> Result<Value, AppError> {
+        self.ensure_host(host_id).await?;
+        for id in group_ids {
+            require_zbx_id(id)?;
+        }
+        if group_ids.is_empty() {
+            return Err(AppError::bad("主机组列表为空"));
+        }
+        let linkage = self.host_linkage(host_id).await?;
+        let mut ids = ids_of(&linkage["groups"], "groupId");
+        apply_link(&mut ids, group_ids, action)?;
+        if ids.is_empty() {
+            return Err(AppError::bad("主机至少要属于一个主机组"));
+        }
+        self.call(
+            "host.update",
+            json!({
+                "hostid": host_id,
+                "groups": ids.iter().map(|id| json!({"groupid": id})).collect::<Vec<_>>(),
+            }),
+        )
+        .await?;
+        self.host_linkage(host_id).await
+    }
+
+    pub async fn host_macros(&self, host_id: &str) -> Result<Vec<Value>, AppError> {
+        self.ensure_host(host_id).await?;
+        let result = self
+            .call(
+                "usermacro.get",
+                json!({
+                    "output": ["hostmacroid", "macro", "value", "description", "type"],
+                    "hostids": [host_id],
+                    "sortfield": "macro",
+                }),
+            )
+            .await?;
+        Ok(result
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|m| {
+                json!({
+                    "hostMacroId": m["hostmacroid"].as_str().unwrap_or(""),
+                    "macro": m["macro"].as_str().unwrap_or(""),
+                    "value": m["value"].as_str().unwrap_or(""),
+                    "description": m["description"].as_str().unwrap_or(""),
+                    "secret": m["type"].as_str() == Some("1"),
+                })
+            })
+            .collect())
+    }
+
+    pub async fn save_host_macros(&self, host_id: &str, macros: &[Value]) -> Result<Vec<Value>, AppError> {
+        self.ensure_host(host_id).await?;
+        let existing = self.host_macros(host_id).await?;
+        let mut by_name = std::collections::HashMap::new();
+        for item in &existing {
+            if let Some(name) = item["macro"].as_str() {
+                by_name.insert(name.to_string(), item.clone());
+            }
+        }
+        for item in macros {
+            let name = item["macro"].as_str().unwrap_or("").trim();
+            require_macro(name)?;
+            let value = item["value"].as_str().unwrap_or("");
+            let description = item["description"].as_str().unwrap_or("");
+            if let Some(old) = by_name.get(name) {
+                if old["secret"].as_bool() == Some(true) && (value.is_empty() || value == "******") {
+                    continue;
+                }
+                let id = old["hostMacroId"].as_str().unwrap_or("");
+                self.call(
+                    "usermacro.update",
+                    json!({
+                        "hostmacroid": id,
+                        "value": value,
+                        "description": description,
+                    }),
+                )
+                .await?;
+            } else {
+                self.call(
+                    "usermacro.create",
+                    json!({
+                        "hostid": host_id,
+                        "macro": name,
+                        "value": value,
+                        "description": description,
+                    }),
+                )
+                .await?;
+            }
+        }
+        self.host_macros(host_id).await
+    }
+
+    pub async fn register_host(&self, body: &Value) -> Result<Value, AppError> {
+        let hostname = body["hostname"].as_str().unwrap_or("").trim();
+        let display = body["displayName"].as_str().unwrap_or(hostname).trim();
+        let ip = body["ip"].as_str().unwrap_or("").trim();
+        if hostname.is_empty() || ip.is_empty() {
+            return Err(AppError::bad("主机名和管理 IP 不能为空"));
+        }
+        let group_ids = string_list(&body["groupIds"]);
+        let template_ids = string_list(&body["templateIds"]);
+        if group_ids.is_empty() {
+            return Err(AppError::bad("请选择主机组"));
+        }
+        for id in group_ids.iter().chain(template_ids.iter()) {
+            require_zbx_id(id)?;
+        }
+        let by_name = self.find_host_id_by_name(hostname).await?;
+        let by_ip = self.find_host_id_by_ip(ip).await?;
+        if let (Some(a), Some(b)) = (&by_name, &by_ip) {
+            if a != b {
+                return Err(AppError::bad("同名主机与同 IP 主机不是同一台，未修改"));
+            }
+        }
+        if let Some(host_id) = by_name.or(by_ip) {
+            self.link_groups(&host_id, &group_ids, "link").await?;
+            if !template_ids.is_empty() {
+                self.link_templates(&host_id, &template_ids, "link").await?;
+            }
+            return Ok(json!({ "hostId": host_id, "created": false }));
+        }
+        let created = self
+            .call(
+                "host.create",
+                json!({
+                    "host": hostname,
+                    "name": display,
+                    "groups": group_ids.iter().map(|id| json!({"groupid": id})).collect::<Vec<_>>(),
+                    "templates": template_ids.iter().map(|id| json!({"templateid": id})).collect::<Vec<_>>(),
+                    "interfaces": [{
+                        "type": 1,
+                        "main": 1,
+                        "useip": 1,
+                        "ip": ip,
+                        "dns": "",
+                        "port": "10050"
+                    }],
+                }),
+            )
+            .await?;
+        let host_id = created["hostids"]
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if host_id.is_empty() {
+            return Err(AppError::internal("Zabbix 未返回新主机 ID"));
+        }
+        Ok(json!({ "hostId": host_id, "created": true }))
+    }
+
+    pub async fn event_hosts(&self, event_id: &str) -> Result<Vec<String>, AppError> {
+        require_zbx_id(event_id)?;
+        let result = self
+            .call(
+                "event.get",
+                json!({
+                    "output": ["eventid"],
+                    "eventids": [event_id],
+                    "selectHosts": ["hostid"],
+                }),
+            )
+            .await?;
+        let event = result
+            .as_array()
+            .and_then(|a| a.first())
+            .cloned()
+            .ok_or_else(|| AppError::NotFound(format!("未找到事件 {event_id}")))?;
+        let ids = event["hosts"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|h| h["hostid"].as_str().map(|s| s.to_string()))
+            .collect();
+        Ok(ids)
+    }
+
+    pub async fn acknowledge_event(&self, event_id: &str, body: &Value) -> Result<Value, AppError> {
+        require_zbx_id(event_id)?;
+        let mut action = 2;
+        let message = body["message"].as_str().unwrap_or("").trim().to_string();
+        if !message.is_empty() {
+            action |= 4;
+        }
+        let mut params = json!({
+            "eventids": [event_id],
+            "action": action,
+        });
+        if !message.is_empty() {
+            params["message"] = json!(message);
+        }
+        if let Some(severity) = body["severity"].as_u64() {
+            if severity > 5 {
+                return Err(AppError::bad("严重级别必须是 0 到 5"));
+            }
+            action |= 8;
+            params["action"] = json!(action);
+            params["severity"] = json!(severity);
+        }
+        if body["close"].as_bool() == Some(true) {
+            action |= 1;
+            params["action"] = json!(action);
+        }
+        self.call("event.acknowledge", params).await?;
+        Ok(json!({ "eventId": event_id }))
+    }
+
+    async fn find_host_id_by_name(&self, hostname: &str) -> Result<Option<String>, AppError> {
+        let result = self
+            .call(
+                "host.get",
+                json!({
+                    "output": ["hostid"],
+                    "filter": { "host": [hostname] },
+                    "limit": 1,
+                }),
+            )
+            .await?;
+        Ok(result
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|h| h["hostid"].as_str().map(|s| s.to_string())))
+    }
+
+    async fn find_host_id_by_ip(&self, ip: &str) -> Result<Option<String>, AppError> {
+        let result = self
+            .call(
+                "hostinterface.get",
+                json!({
+                    "output": ["hostid", "ip"],
+                    "filter": { "ip": [ip] },
+                    "limit": 1,
+                }),
+            )
+            .await?;
+        Ok(result
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|h| h["hostid"].as_str().map(|s| s.to_string())))
+    }
+
+    pub fn protected(&self) -> bool {
+        self.instance.protected
+    }
+
+    pub(crate) async fn call(&self, method: &str, params: Value) -> Result<Value, AppError> {
         let needs_auth = method != "apiinfo.version";
         let auth = if needs_auth {
             Some(self.resolve_auth_mode().await?)
@@ -563,7 +989,7 @@ impl ZabbixClient {
             .await
             .map_err(|e| AppError::internal(format!("解析 Zabbix 响应失败: {e}")))?;
         if let Some(err) = payload.get("error") {
-            return Err(AppError::internal(format!("Zabbix API 错误: {err}")));
+            return Err(AppError::bad(zabbix_error_message(err)));
         }
         Ok(payload.get("result").cloned().unwrap_or(Value::Null))
     }
@@ -603,6 +1029,100 @@ fn zabbix_version_lt_7_2(version: &str) -> bool {
     major < 7 || (major == 7 && minor < 2)
 }
 
+fn require_zbx_id(id: &str) -> Result<(), AppError> {
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_digit()) {
+        return Err(AppError::bad("标识无效"));
+    }
+    Ok(())
+}
+
+fn require_macro(name: &str) -> Result<(), AppError> {
+    let ok = name.starts_with("{$")
+        && name.ends_with('}')
+        && name.len() > 3
+        && name.len() <= 255
+        && name.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '{' | '}' | '$' | '_' | '.' | ':')
+        });
+    if !ok {
+        return Err(AppError::bad(format!("宏格式无效: {name}")));
+    }
+    Ok(())
+}
+
+fn apply_link(current: &mut Vec<String>, incoming: &[String], action: &str) -> Result<(), AppError> {
+    match action {
+        "link" => {
+            for id in incoming {
+                if !current.iter().any(|x| x == id) {
+                    current.push(id.clone());
+                }
+            }
+            Ok(())
+        }
+        "unlink" => {
+            current.retain(|id| !incoming.iter().any(|x| x == id));
+            Ok(())
+        }
+        _ => Err(AppError::bad("action 只能是 link 或 unlink")),
+    }
+}
+
+fn ids_of(value: &Value, key: &str) -> Vec<String> {
+    value
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|item| item[key].as_str().map(|s| s.to_string()))
+        .collect()
+}
+
+fn string_list(value: &Value) -> Vec<String> {
+    value
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn map_template(template: &Value) -> Value {
+    json!({
+        "templateId": template["templateid"].as_str().unwrap_or(""),
+        "host": template["host"].as_str().unwrap_or(""),
+        "name": template["name"].as_str().unwrap_or(""),
+        "groups": map_id_names(&template["templategroups"], "groupid", "groupId"),
+        "parentTemplates": map_id_names(&template["parentTemplates"], "templateid", "templateId"),
+    })
+}
+
+fn map_id_names(value: &Value, id_key: &str, out_key: &str) -> Vec<Value> {
+    value
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|item| {
+            json!({
+                out_key: item[id_key].as_str().unwrap_or(""),
+                "name": item["name"].as_str().unwrap_or(""),
+            })
+        })
+        .collect()
+}
+
+fn zabbix_error_message(err: &Value) -> String {
+    err.get("data")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| err.get("message").and_then(|v| v.as_str()))
+        .unwrap_or("Zabbix API 错误")
+        .to_string()
+}
+
 fn map_host(host: &Value, items: &[Value]) -> Value {
     let host_id = host["hostid"].as_str().unwrap_or("");
     let ip = primary_ip(host);
@@ -620,6 +1140,7 @@ fn map_host(host: &Value, items: &[Value]) -> Value {
         "ip": ip,
         "agentAvailable": available,
         "agentVersion": version,
+        "groups": map_id_names(&host["hostgroups"], "groupid", "groupId"),
     })
 }
 

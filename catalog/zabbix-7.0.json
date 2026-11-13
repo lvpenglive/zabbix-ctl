@@ -1,0 +1,50 @@
+{
+  "version": "7.0",
+  "itemTypes": [
+    {"type": 0, "name": "Zabbix agent", "editable": true, "fields": ["name", "key", "delay", "valueType", "units", "preprocessing"]},
+    {"type": 7, "name": "Zabbix agent（主动）", "editable": true, "fields": ["name", "key", "delay", "valueType", "units", "preprocessing"]},
+    {"type": 20, "name": "SNMP agent", "editable": true, "fields": ["name", "key", "delay", "valueType", "units", "snmpOid", "preprocessing"]},
+    {"type": 3, "name": "简单检查", "editable": true, "fields": ["name", "key", "delay", "valueType", "units", "preprocessing"]},
+    {"type": 18, "name": "依赖项", "editable": true, "fields": ["name", "key", "valueType", "units", "masterItemId", "preprocessing"]},
+    {"type": 15, "name": "计算项", "editable": true, "fields": ["name", "key", "valueType", "units", "params", "preprocessing"]},
+    {"type": 19, "name": "HTTP agent", "editable": true, "fields": ["name", "key", "delay", "valueType", "units", "url", "requestMethod", "statusCodes", "preprocessing"]},
+    {"type": 2, "name": "采集器", "editable": true, "fields": ["name", "key", "valueType", "units", "preprocessing"]},
+    {"type": 5, "name": "Zabbix internal", "editable": false, "fields": []},
+    {"type": 12, "name": "IPMI", "editable": false, "fields": []},
+    {"type": 16, "name": "JMX", "editable": false, "fields": []},
+    {"type": 21, "name": "脚本", "editable": false, "fields": []}
+  ],
+  "valueTypes": [
+    {"value": 0, "name": "浮点"},
+    {"value": 1, "name": "字符"},
+    {"value": 3, "name": "整数"},
+    {"value": 4, "name": "文本"}
+  ],
+  "preprocessing": [
+    {"type": 1, "name": "正则", "paramsHint": "表达式与输出用制表符分隔，如 pattern\\t\\1"},
+    {"type": 6, "name": "JSONPath", "paramsHint": "$.path"},
+    {"type": 11, "name": "倍数", "paramsHint": "乘数，如 0.001"},
+    {"type": 12, "name": "变更", "paramsHint": "留空"},
+    {"type": 13, "name": "每秒变更", "paramsHint": "留空"},
+    {"type": 19, "name": "丢弃未变化", "paramsHint": "留空"},
+    {"type": 20, "name": "丢弃未变化（含心跳）", "paramsHint": "心跳秒数"}
+  ],
+  "severities": [
+    {"value": 0, "name": "未分类"},
+    {"value": 1, "name": "信息"},
+    {"value": 2, "name": "警告"},
+    {"value": 3, "name": "一般严重"},
+    {"value": 4, "name": "严重"},
+    {"value": 5, "name": "灾难"}
+  ],
+  "functions": [
+    {"name": "last", "insert": "last(/{host}/{key})", "hint": "最新值"},
+    {"name": "min", "insert": "min(/{host}/{key},{time})", "hint": "区间最小"},
+    {"name": "max", "insert": "max(/{host}/{key},{time})", "hint": "区间最大"},
+    {"name": "avg", "insert": "avg(/{host}/{key},{time})", "hint": "区间平均"},
+    {"name": "sum", "insert": "sum(/{host}/{key},{time})", "hint": "区间求和"},
+    {"name": "nodata", "insert": "nodata(/{host}/{key},{time})=1", "hint": "无数据"},
+    {"name": "change", "insert": "change(/{host}/{key})<>0", "hint": "值发生变化"},
+    {"name": "count", "insert": "count(/{host}/{key},{time},\"gt\",{threshold})", "hint": "超过阈值的次数"}
+  ]
+}

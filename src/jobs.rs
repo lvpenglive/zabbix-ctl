@@ -26,12 +26,21 @@ impl JobClient {
     }
 
     pub async fn execute(&self, job_id: i64, asset_id: &str) -> Result<i64, AppError> {
+        self.execute_with_env(job_id, asset_id, &json!({})).await
+    }
+
+    pub async fn execute_with_env(
+        &self,
+        job_id: i64,
+        asset_id: &str,
+        env: &Value,
+    ) -> Result<i64, AppError> {
         let url = format!("{}/api/jobs/{}/execute", self.base_url, job_id);
         let response = self
             .http
             .post(url)
             .header("Authorization", format!("Bearer {}", self.token))
-            .json(&json!({ "assetIds": [asset_id] }))
+            .json(&json!({ "assetIds": [asset_id], "env": env }))
             .send()
             .await
             .map_err(|e| AppError::internal(format!("调用作业执行失败: {e}")))?;

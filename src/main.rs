@@ -1,8 +1,10 @@
 mod auth;
+mod designer;
 mod config;
 mod db;
 mod error;
 mod jobs;
+mod lld;
 mod routes;
 mod state;
 mod worker;
