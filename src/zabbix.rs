@@ -17,6 +17,8 @@ const ITEM_KEYS: &[&str] = &[
     "agent.version",
     "agent.ping",
     "system.cpu.util",
+    // Zabbix 7 Linux 模板用 vm.memory.util；旧模板常见 utilization / pused
+    "vm.memory.util",
     "vm.memory.utilization",
     "vm.memory.size[pused]",
     "vfs.fs.dependent.size[/,pused]",
@@ -98,6 +100,46 @@ impl ZabbixClient {
             .collect())
     }
 
+    /// 已启用主机的轻量名册。不查监控项；Agent 通断只看接口 available。
+    pub async fn enabled_hosts_light(&self) -> Result<Vec<Value>, AppError> {
+        let result = self
+            .call(
+                "host.get",
+                json!({
+                    "output": ["hostid", "host", "name", "status"],
+                    "selectInterfaces": ["ip", "dns", "type", "main", "available"],
+                    "selectHostGroups": ["groupid", "name"],
+                    "filter": { "status": 0 },
+                    "sortfield": "host",
+                }),
+            )
+            .await?;
+        let hosts = result.as_array().cloned().unwrap_or_default();
+        Ok(hosts.iter().map(|h| map_host(h, &[])).collect())
+    }
+
+    /// 只给当前页补 agent.version，避免全量 item.get。
+    pub async fn attach_agent_versions(&self, hosts: &mut [Value]) -> Result<(), AppError> {
+        let ids: Vec<String> = hosts
+            .iter()
+            .filter_map(|h| h["hostId"].as_str().map(|s| s.to_string()))
+            .filter(|s| !s.is_empty())
+            .collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let items = self
+            .items_for_hosts_with_keys(&ids, &["agent.version"])
+            .await?;
+        for host in hosts.iter_mut() {
+            let id = host["hostId"].as_str().unwrap_or("");
+            if let Some(version) = last_value(&items, id, &["agent.version"]) {
+                host["agentVersion"] = json!(version);
+            }
+        }
+        Ok(())
+    }
+
     pub async fn host_problems(&self, host_id: &str) -> Result<Vec<Value>, AppError> {
         self.ensure_host(host_id).await?;
         let result = self
@@ -141,7 +183,11 @@ impl ZabbixClient {
             ("cpu", &["system.cpu.util"][..]),
             (
                 "memory",
-                &["vm.memory.utilization", "vm.memory.size[pused]"][..],
+                &[
+                    "vm.memory.util",
+                    "vm.memory.utilization",
+                    "vm.memory.size[pused]",
+                ][..],
             ),
             (
                 "disk",
@@ -163,6 +209,214 @@ impl ZabbixClient {
             }));
         }
         Ok(series)
+    }
+
+    /// 主机监控项只读列表，含最新值。不限制 key，按名称/键搜索可选。
+    pub async fn host_items(
+        &self,
+        host_id: &str,
+        search: Option<&str>,
+    ) -> Result<Vec<Value>, AppError> {
+        self.ensure_host(host_id).await?;
+        let mut params = json!({
+            "output": [
+                "itemid", "name", "key_", "lastvalue", "lastclock",
+                "status", "state", "units", "value_type", "templateid", "error"
+            ],
+            "hostids": [host_id],
+            "sortfield": "name",
+            "limit": 500,
+        });
+        if let Some(q) = search.map(str::trim).filter(|s| !s.is_empty()) {
+            params["search"] = json!({ "name": q, "key_": q });
+            params["searchByAny"] = json!(true);
+        }
+        let result = self.call("item.get", params).await?;
+        let rows = result.as_array().cloned().unwrap_or_default();
+        let parent_ids: Vec<String> = rows
+            .iter()
+            .filter_map(|item| {
+                let id = item["templateid"].as_str().unwrap_or("0");
+                if id == "0" || id.is_empty() {
+                    None
+                } else {
+                    Some(id.to_string())
+                }
+            })
+            .collect();
+        let parents = self.templates_of_parent_items(&parent_ids).await?;
+        Ok(rows
+            .into_iter()
+            .map(|item| {
+                let parent_id = item["templateid"].as_str().unwrap_or("0");
+                let inherited = parent_id != "0" && !parent_id.is_empty();
+                let (template_id, template_name) = parents
+                    .get(parent_id)
+                    .cloned()
+                    .unwrap_or_default();
+                json!({
+                    "itemId": item["itemid"].as_str().unwrap_or(""),
+                    "name": item["name"].as_str().unwrap_or(""),
+                    "key": item["key_"].as_str().unwrap_or(""),
+                    "lastValue": item["lastvalue"].as_str().unwrap_or(""),
+                    "lastClock": item["lastclock"].as_str().unwrap_or("0"),
+                    "units": item["units"].as_str().unwrap_or(""),
+                    "status": item["status"].as_str().unwrap_or("0"),
+                    "state": item["state"].as_str().unwrap_or("0"),
+                    "valueType": item["value_type"].as_str().unwrap_or(""),
+                    "inherited": inherited,
+                    "templateId": template_id,
+                    "templateName": template_name,
+                    "error": item["error"].as_str().unwrap_or(""),
+                })
+            })
+            .collect())
+    }
+
+    /// 主机触发器只读列表。
+    pub async fn host_triggers(&self, host_id: &str) -> Result<Vec<Value>, AppError> {
+        self.ensure_host(host_id).await?;
+        let result = self
+            .call(
+                "trigger.get",
+                json!({
+                    "output": [
+                        "triggerid", "description", "priority", "value",
+                        "status", "state", "lastchange", "templateid", "error"
+                    ],
+                    "hostids": [host_id],
+                    "sortfield": "priority",
+                    "sortorder": "DESC",
+                    "limit": 500,
+                }),
+            )
+            .await?;
+        let rows = result.as_array().cloned().unwrap_or_default();
+        let parent_ids: Vec<String> = rows
+            .iter()
+            .filter_map(|row| {
+                let id = row["templateid"].as_str().unwrap_or("0");
+                if id == "0" || id.is_empty() {
+                    None
+                } else {
+                    Some(id.to_string())
+                }
+            })
+            .collect();
+        let parents = self.templates_of_parent_triggers(&parent_ids).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let parent_id = row["templateid"].as_str().unwrap_or("0");
+                let inherited = parent_id != "0" && !parent_id.is_empty();
+                let (template_id, template_name) = parents
+                    .get(parent_id)
+                    .cloned()
+                    .unwrap_or_default();
+                json!({
+                    "triggerId": row["triggerid"].as_str().unwrap_or(""),
+                    "name": row["description"].as_str().unwrap_or(""),
+                    "severity": row["priority"].as_str().unwrap_or("0"),
+                    "value": row["value"].as_str().unwrap_or("0"),
+                    "status": row["status"].as_str().unwrap_or("0"),
+                    "state": row["state"].as_str().unwrap_or("0"),
+                    "lastChange": row["lastchange"].as_str().unwrap_or("0"),
+                    "inherited": inherited,
+                    "templateId": template_id,
+                    "templateName": template_name,
+                    "error": row["error"].as_str().unwrap_or(""),
+                })
+            })
+            .collect())
+    }
+
+    /// 父监控项 ID → (模板 ID, 模板名)。`templateid` 指向父监控项，再取该监控项所属模板。
+    async fn templates_of_parent_items(
+        &self,
+        parent_item_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, (String, String)>, AppError> {
+        let mut map = std::collections::HashMap::new();
+        let mut uniq = parent_item_ids.to_vec();
+        uniq.sort();
+        uniq.dedup();
+        if uniq.is_empty() {
+            return Ok(map);
+        }
+        for chunk in uniq.chunks(ITEM_GET_HOST_CHUNK) {
+            let result = self
+                .call(
+                    "item.get",
+                    json!({
+                        "output": ["itemid"],
+                        "itemids": chunk,
+                        "selectHosts": ["hostid", "name", "host"],
+                    }),
+                )
+                .await?;
+            for item in result.as_array().cloned().unwrap_or_default() {
+                let parent_id = item["itemid"].as_str().unwrap_or("").to_string();
+                let host = item["hosts"]
+                    .as_array()
+                    .and_then(|a| a.first())
+                    .cloned()
+                    .unwrap_or(json!({}));
+                let template_id = host["hostid"].as_str().unwrap_or("").to_string();
+                let template_name = host["name"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| host["host"].as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if !parent_id.is_empty() {
+                    map.insert(parent_id, (template_id, template_name));
+                }
+            }
+        }
+        Ok(map)
+    }
+
+    async fn templates_of_parent_triggers(
+        &self,
+        parent_trigger_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, (String, String)>, AppError> {
+        let mut map = std::collections::HashMap::new();
+        let mut uniq = parent_trigger_ids.to_vec();
+        uniq.sort();
+        uniq.dedup();
+        if uniq.is_empty() {
+            return Ok(map);
+        }
+        for chunk in uniq.chunks(ITEM_GET_HOST_CHUNK) {
+            let result = self
+                .call(
+                    "trigger.get",
+                    json!({
+                        "output": ["triggerid"],
+                        "triggerids": chunk,
+                        "selectHosts": ["hostid", "name", "host"],
+                    }),
+                )
+                .await?;
+            for row in result.as_array().cloned().unwrap_or_default() {
+                let parent_id = row["triggerid"].as_str().unwrap_or("").to_string();
+                let host = row["hosts"]
+                    .as_array()
+                    .and_then(|a| a.first())
+                    .cloned()
+                    .unwrap_or(json!({}));
+                let template_id = host["hostid"].as_str().unwrap_or("").to_string();
+                let template_name = host["name"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| host["host"].as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if !parent_id.is_empty() {
+                    map.insert(parent_id, (template_id, template_name));
+                }
+            }
+        }
+        Ok(map)
     }
 
     async fn ensure_host(&self, host_id: &str) -> Result<(), AppError> {

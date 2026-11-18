@@ -25,6 +25,14 @@ pub fn router() -> Router<AppState> {
             "/api/instances/:code/hosts/:host_id/metrics",
             get(host_metrics),
         )
+        .route(
+            "/api/instances/:code/hosts/:host_id/items",
+            get(host_items),
+        )
+        .route(
+            "/api/instances/:code/hosts/:host_id/triggers",
+            get(host_triggers_list),
+        )
         .route("/api/instances/:code/sync", post(sync_hosts))
         .route("/api/instances/:code/governance", get(governance))
         .route(
@@ -115,9 +123,16 @@ async fn instance_version(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct HostListQuery {
-    limit: Option<u32>,
     search: Option<String>,
+    page: Option<u32>,
+    page_size: Option<u32>,
+    group_id: Option<String>,
+    /// online / offline / unknown
+    agent: Option<String>,
+    /// linked / unlinked
+    cmdb: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,13 +147,123 @@ async fn list_hosts(
     Query(q): Query<HostListQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let client = client_for(&state, &code)?;
-    let mut hosts = client
-        .list_hosts(q.limit, q.search.as_deref())
-        .await?;
+    let mut hosts = client.enabled_hosts_light().await?;
     if let Some(pool) = state.db.as_ref() {
         enrich_hosts_with_links(pool, &code, &mut hosts).await?;
     }
-    Ok(Json(json!({ "code": 0, "data": hosts })))
+    let total = hosts.len();
+    let groups = group_counts(&hosts);
+    let matched_rows = filter_roster(&hosts, &q);
+    let matched = matched_rows.len();
+    let page_size = q.page_size.unwrap_or(20).clamp(1, 100);
+    let page = q.page.unwrap_or(1).max(1);
+    let start = ((page - 1) as usize).saturating_mul(page_size as usize);
+    let mut items = if start >= matched {
+        Vec::new()
+    } else {
+        let end = (start + page_size as usize).min(matched);
+        matched_rows[start..end].to_vec()
+    };
+    client.attach_agent_versions(&mut items).await?;
+    Ok(Json(json!({
+        "code": 0,
+        "data": {
+            "total": total,
+            "matched": matched,
+            "page": page,
+            "pageSize": page_size,
+            "groups": groups,
+            "items": items,
+        }
+    })))
+}
+
+fn group_counts(hosts: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let mut counts: std::collections::HashMap<String, (String, usize)> = std::collections::HashMap::new();
+    for host in hosts {
+        let Some(groups) = host["groups"].as_array() else {
+            continue;
+        };
+        for group in groups {
+            let id = group["groupId"].as_str().unwrap_or("").trim();
+            if id.is_empty() {
+                continue;
+            }
+            let name = group["name"].as_str().unwrap_or("").to_string();
+            let entry = counts.entry(id.to_string()).or_insert((name, 0));
+            entry.1 += 1;
+        }
+    }
+    let mut rows: Vec<_> = counts
+        .into_iter()
+        .filter(|(_, (_, n))| *n > 0)
+        .map(|(id, (name, n))| (id, name, n))
+        .collect();
+    rows.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
+    rows.into_iter()
+        .map(|(id, name, n)| json!({ "groupId": id, "name": name, "hostCount": n }))
+        .collect()
+}
+
+fn filter_roster(hosts: &[serde_json::Value], q: &HostListQuery) -> Vec<serde_json::Value> {
+    let search = q
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_lowercase());
+    let group_id = q.group_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let agent = q.agent.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let cmdb = q.cmdb.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    hosts
+        .iter()
+        .filter(|host| {
+            if let Some(keyword) = &search {
+                let blob = format!(
+                    "{} {} {}",
+                    host["displayName"].as_str().unwrap_or(""),
+                    host["hostname"].as_str().unwrap_or(""),
+                    host["ip"].as_str().unwrap_or("")
+                );
+                if !blob.to_lowercase().contains(keyword) {
+                    return false;
+                }
+            }
+            if let Some(gid) = group_id {
+                let hit = host["groups"].as_array().is_some_and(|groups| {
+                    groups.iter().any(|g| g["groupId"].as_str() == Some(gid))
+                });
+                if !hit {
+                    return false;
+                }
+            }
+            if let Some(flag) = agent {
+                let available = host["agentAvailable"].as_bool();
+                let ok = match flag {
+                    "online" => available == Some(true),
+                    "offline" => available == Some(false),
+                    "unknown" => available.is_none(),
+                    _ => true,
+                };
+                if !ok {
+                    return false;
+                }
+            }
+            if let Some(flag) = cmdb {
+                let linked = host["cmdbLinked"].as_bool().unwrap_or(false);
+                let ok = match flag {
+                    "linked" => linked,
+                    "unlinked" => !linked,
+                    _ => true,
+                };
+                if !ok {
+                    return false;
+                }
+            }
+            true
+        })
+        .cloned()
+        .collect()
 }
 
 async fn enrich_hosts_with_links(
@@ -190,6 +315,34 @@ async fn host_metrics(
         .host_metrics(&host_id, q.hours.unwrap_or(24))
         .await?;
     Ok(Json(json!({ "code": 0, "data": series })))
+}
+
+#[derive(Debug, Deserialize)]
+struct HostItemsQuery {
+    search: Option<String>,
+}
+
+async fn host_items(
+    State(state): State<AppState>,
+    _auth: ServiceAuth,
+    Path((code, host_id)): Path<(String, String)>,
+    Query(q): Query<HostItemsQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let client = client_for(&state, &code)?;
+    let items = client
+        .host_items(&host_id, q.search.as_deref())
+        .await?;
+    Ok(Json(json!({ "code": 0, "data": items })))
+}
+
+async fn host_triggers_list(
+    State(state): State<AppState>,
+    _auth: ServiceAuth,
+    Path((code, host_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let client = client_for(&state, &code)?;
+    let triggers = client.host_triggers(&host_id).await?;
+    Ok(Json(json!({ "code": 0, "data": triggers })))
 }
 
 async fn sync_hosts(
