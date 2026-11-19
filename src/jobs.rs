@@ -35,7 +35,7 @@ impl JobClient {
         asset_id: &str,
         env: &Value,
     ) -> Result<i64, AppError> {
-        let url = format!("{}/api/jobs/{}/execute", self.base_url, job_id);
+        let url = format!("{}/api/jobs/definitions/{}/execute", self.base_url, job_id);
         let response = self
             .http
             .post(url)
@@ -90,9 +90,11 @@ impl JobClient {
             let msg = body["message"].as_str().unwrap_or("查询作业失败");
             return Err(AppError::bad(msg));
         }
-        Ok(body["data"]["overallStatus"]
+        // Gateway 单条 run 详情在 data.run 下；兼容旧扁平结构
+        let status = body["data"]["run"]["overallStatus"]
             .as_str()
-            .unwrap_or("running")
-            .to_string())
+            .or_else(|| body["data"]["overallStatus"].as_str())
+            .unwrap_or("running");
+        Ok(status.to_string())
     }
 }

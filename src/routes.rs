@@ -35,6 +35,8 @@ pub fn router() -> Router<AppState> {
         )
         .route("/api/instances/:code/sync", post(sync_hosts))
         .route("/api/instances/:code/governance", get(governance))
+        .route("/api/instances/:code/proxies", get(list_proxies))
+        .route("/api/instances/:code/proxy-groups", get(list_proxy_groups))
         .route(
             "/api/instances/:code/template-groups",
             get(template_groups).post(designer::create_template_group),
@@ -68,6 +70,15 @@ pub fn router() -> Router<AppState> {
             get(host_macros).put(save_host_macros),
         )
         .route("/api/instances/:code/hosts", post(register_host))
+        .route(
+            "/api/instances/:code/hosts/massupdate",
+            post(mass_update_hosts),
+        )
+        .route("/api/instances/:code/hosts/delete", post(delete_hosts))
+        .route(
+            "/api/instances/:code/hosts/:host_id",
+            get(get_host_detail).put(update_host),
+        )
         .route("/api/instances/:code/events/:event_id", get(event_hosts))
         .route(
             "/api/instances/:code/events/:event_id/ack",
@@ -133,6 +144,8 @@ struct HostListQuery {
     agent: Option<String>,
     /// linked / unlinked
     cmdb: Option<String>,
+    /// 0 启用 / 1 禁用；空=全部
+    status: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -147,7 +160,17 @@ async fn list_hosts(
     Query(q): Query<HostListQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let client = client_for(&state, &code)?;
-    let mut hosts = client.enabled_hosts_light().await?;
+    let status_filter = q.status.as_deref().and_then(|s| match s.trim() {
+        "0" | "enabled" => Some(0),
+        "1" | "disabled" => Some(1),
+        _ => None,
+    });
+    // 名册默认含启用+禁用；仅当显式传 status 时在 Zabbix 侧过滤
+    let mut hosts = if status_filter.is_some() {
+        client.hosts_light(status_filter).await?
+    } else {
+        client.hosts_light(None).await?
+    };
     if let Some(pool) = state.db.as_ref() {
         enrich_hosts_with_links(pool, &code, &mut hosts).await?;
     }
@@ -260,6 +283,17 @@ fn filter_roster(hosts: &[serde_json::Value], q: &HostListQuery) -> Vec<serde_js
                     return false;
                 }
             }
+            if let Some(st) = q.status.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                let host_status = host["status"].as_str().unwrap_or("0");
+                let ok = match st {
+                    "0" | "enabled" => host_status == "0",
+                    "1" | "disabled" => host_status == "1",
+                    _ => true,
+                };
+                if !ok {
+                    return false;
+                }
+            }
             true
         })
         .cloned()
@@ -273,7 +307,8 @@ async fn enrich_hosts_with_links(
 ) -> Result<(), AppError> {
     use sqlx::Row;
     let rows = sqlx::query(
-        "SELECT host_id, ci_id, agent_version, agent_available FROM zbx_host_links WHERE instance_code = ?",
+        "SELECT host_id, ci_id, install_path, package_id, conf_suffix \
+         FROM zbx_host_links WHERE instance_code = ?",
     )
     .bind(instance_code)
     .fetch_all(pool)
@@ -283,12 +318,19 @@ async fn enrich_hosts_with_links(
     for r in rows {
         let host_id: String = r.try_get("host_id").unwrap_or_default();
         let ci_id: Option<String> = r.try_get("ci_id").ok().flatten();
-        map.insert(host_id, ci_id);
+        let install_path: Option<String> = r.try_get("install_path").ok().flatten();
+        let package_id: Option<String> = r.try_get("package_id").ok().flatten();
+        let conf_suffix: Option<String> = r.try_get("conf_suffix").ok().flatten();
+        map.insert(host_id, (ci_id, install_path, package_id, conf_suffix));
     }
     for h in hosts.iter_mut() {
         let id = h["hostId"].as_str().unwrap_or("").to_string();
-        let linked = map.get(&id).cloned().flatten();
-        h["ciId"] = json!(linked);
+        if let Some((ci_id, install_path, package_id, conf_suffix)) = map.get(&id) {
+            h["ciId"] = json!(ci_id);
+            h["installPath"] = json!(install_path);
+            h["packageId"] = json!(package_id);
+            h["confSuffix"] = json!(conf_suffix);
+        }
         h["cmdbLinked"] = json!(h["ciId"].as_str().map(|s| !s.is_empty()).unwrap_or(false));
     }
     Ok(())
@@ -400,7 +442,47 @@ struct CreateTaskRequest {
     #[serde(default)]
     template_ids: Vec<String>,
     server: Option<String>,
+    agent_port: Option<String>,
     server_active: Option<String>,
+    proxy_id: Option<String>,
+    proxy_group_id: Option<String>,
+    package_id: Option<String>,
+    install_path: Option<String>,
+    conf_suffix: Option<String>,
+}
+
+async fn list_proxies(
+    State(state): State<AppState>,
+    _auth: ServiceAuth,
+    Path(code): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let instance = state
+        .config
+        .zabbix
+        .iter()
+        .find(|z| z.enabled && z.code == code)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(format!("未找到 Zabbix 实例 {code}")))?;
+    let client = ZabbixClient::new(state.http.clone(), instance.clone())?;
+    let data = client.list_proxies(instance.proxy_stale_secs).await?;
+    Ok(Json(json!({ "code": 0, "data": data })))
+}
+
+async fn list_proxy_groups(
+    State(state): State<AppState>,
+    _auth: ServiceAuth,
+    Path(code): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let instance = state
+        .config
+        .zabbix
+        .iter()
+        .find(|z| z.enabled && z.code == code)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(format!("未找到 Zabbix 实例 {code}")))?;
+    let client = ZabbixClient::new(state.http.clone(), instance.clone())?;
+    let data = client.list_proxy_groups(instance.proxy_stale_secs).await?;
+    Ok(Json(json!({ "code": 0, "data": data })))
 }
 
 async fn create_task(
@@ -423,7 +505,13 @@ async fn create_task(
             &req.group_ids,
             &req.template_ids,
             req.server.as_deref().unwrap_or(""),
+            req.agent_port.as_deref().unwrap_or(""),
             req.server_active.as_deref().unwrap_or(""),
+            req.proxy_id.as_deref().unwrap_or(""),
+            req.proxy_group_id.as_deref().unwrap_or(""),
+            req.package_id.as_deref().unwrap_or(""),
+            req.install_path.as_deref().unwrap_or("/opt/ITM/IIM/zabbix_agentd"),
+            req.conf_suffix.as_deref().unwrap_or(""),
             concurrency,
             requested_by,
         )
@@ -436,6 +524,7 @@ async fn create_task(
             &req.action,
             &req.host_ids,
             req.target_version.as_deref(),
+            req.package_id.as_deref(),
             concurrency,
             requested_by,
         )
@@ -588,6 +677,57 @@ async fn register_host(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let data = client_for_write(&state, &code)?.register_host(&body).await?;
+    Ok(Json(json!({ "code": 0, "data": data })))
+}
+
+async fn get_host_detail(
+    State(state): State<AppState>,
+    _auth: ServiceAuth,
+    Path((code, host_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let data = client_for(&state, &code)?.get_host_detail(&host_id).await?;
+    Ok(Json(json!({ "code": 0, "data": data })))
+}
+
+async fn update_host(
+    State(state): State<AppState>,
+    _auth: ServiceAuth,
+    Path((code, host_id)): Path<(String, String)>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let data = client_for_write(&state, &code)?
+        .update_host(&host_id, &body)
+        .await?;
+    Ok(Json(json!({ "code": 0, "data": data })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HostIdsBody {
+    host_ids: Vec<String>,
+}
+
+async fn delete_hosts(
+    State(state): State<AppState>,
+    _auth: ServiceAuth,
+    Path(code): Path<String>,
+    Json(body): Json<HostIdsBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let data = client_for_write(&state, &code)?
+        .delete_hosts(&body.host_ids)
+        .await?;
+    Ok(Json(json!({ "code": 0, "data": data })))
+}
+
+async fn mass_update_hosts(
+    State(state): State<AppState>,
+    _auth: ServiceAuth,
+    Path(code): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let data = client_for_write(&state, &code)?
+        .mass_update_hosts(&body)
+        .await?;
     Ok(Json(json!({ "code": 0, "data": data })))
 }
 

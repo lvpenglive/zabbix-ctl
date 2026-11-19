@@ -33,7 +33,7 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
         return Ok(());
     };
     let row = sqlx::query(
-        "SELECT id, instance_code, action, target_version, concurrency, requested_by \
+        "SELECT id, instance_code, action, target_version, package_id, concurrency, requested_by \
          FROM zbx_tasks WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1",
     )
     .fetch_optional(pool)
@@ -45,6 +45,7 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
     let instance_code: String = row.try_get("instance_code")?;
     let action: String = row.try_get("action")?;
     let target_version: Option<String> = row.try_get("target_version")?;
+    let package_id: Option<String> = row.try_get("package_id")?;
     let concurrency: i32 = row.try_get("concurrency").unwrap_or(10);
     let updated = sqlx::query(
         "UPDATE zbx_tasks SET status = 'running' WHERE id = ? AND status = 'pending'",
@@ -64,6 +65,7 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
         &instance_code,
         &action,
         target_version.as_deref(),
+        package_id.as_deref(),
         concurrency.max(1) as usize,
     )
     .await
@@ -87,6 +89,7 @@ async fn run_task(
     instance_code: &str,
     action: &str,
     target_version: Option<&str>,
+    package_id: Option<&str>,
     concurrency: usize,
 ) -> anyhow::Result<()> {
     let instance = state
@@ -154,7 +157,9 @@ async fn run_task(
             .cloned()
             .unwrap();
         let action = action.to_string();
+        let instance_code = instance_code.to_string();
         let target_version = target_version.map(|s| s.to_string());
+        let package_id = package_id.map(|s| s.to_string());
         let job_id = job_id;
         let job_client = job_client.clone();
         let task_id = task_id.to_string();
@@ -163,10 +168,12 @@ async fn run_task(
             let result = process_host(
                 &pool,
                 &task_id,
+                &instance_code,
                 &host_id,
                 ci_id.as_deref(),
                 &action,
                 target_version.as_deref(),
+                package_id.as_deref(),
                 job_id,
                 job_client.as_ref(),
                 zbx_http,
@@ -195,9 +202,9 @@ async fn run_task(
 
     let counts = sqlx::query(
         "SELECT \
-            SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END) AS ok_n, \
-            SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS fail_n, \
-            COUNT(*) AS total_n \
+            CAST(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END) AS SIGNED) AS ok_n, \
+            CAST(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS SIGNED) AS fail_n, \
+            CAST(COUNT(*) AS SIGNED) AS total_n \
          FROM zbx_task_hosts WHERE task_id = ?",
     )
     .bind(task_id)
@@ -254,10 +261,12 @@ async fn resolve_job_id(
 async fn process_host(
     pool: &DbPool,
     task_id: &str,
+    instance_code: &str,
     host_id: &str,
     ci_id: Option<&str>,
     action: &str,
     target_version: Option<&str>,
+    package_id: Option<&str>,
     job_id: Option<i64>,
     job_client: Option<&JobClient>,
     http: reqwest::Client,
@@ -285,8 +294,40 @@ async fn process_host(
         anyhow::bail!("作业客户端不可用，检查 MERIDIANOPS_JOB_TOKEN");
     };
 
+    let link = sqlx::query(
+        "SELECT install_path, package_id FROM zbx_host_links \
+         WHERE instance_code = ? AND host_id = ?",
+    )
+    .bind(instance_code)
+    .bind(host_id)
+    .fetch_optional(pool)
+    .await?;
+    let install_path: String = link
+        .as_ref()
+        .and_then(|r| r.try_get::<Option<String>, _>("install_path").ok().flatten())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/opt/ITM/IIM/zabbix_agentd".to_string());
+    let mut env = serde_json::Map::new();
+    env.insert(
+        "ZBX_INSTALL_PATH".into(),
+        serde_json::json!(install_path),
+    );
+    if matches!(action, "upgrade" | "rollback") {
+        let pkg = package_id.map(str::trim).filter(|s| !s.is_empty()).unwrap_or("");
+        if pkg.is_empty() {
+            anyhow::bail!("升级/回滚未指定 Agent 包");
+        }
+        env.insert("ZBX_PACKAGE_ID".into(), serde_json::json!(pkg));
+    }
+    let env = serde_json::Value::Object(env);
+
+    let wait_secs = if matches!(action, "upgrade" | "rollback") {
+        900u64
+    } else {
+        600
+    };
     let run_id = job_client
-        .execute(job_id, ci_id)
+        .execute_with_env(job_id, ci_id, &env)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     sqlx::query("UPDATE zbx_task_hosts SET job_run_id = ? WHERE task_id = ? AND host_id = ?")
@@ -296,7 +337,7 @@ async fn process_host(
         .execute(pool)
         .await?;
     let overall = job_client
-        .wait_run(run_id, 600)
+        .wait_run(run_id, wait_secs)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     // 作业结束后稍等 Agent 上报版本
@@ -305,10 +346,16 @@ async fn process_host(
 
     let ok = match action {
         "upgrade" | "rollback" => {
-            if let Some(target) = target_version {
-                after.as_deref() == Some(target)
+            if overall != "success" {
+                false
+            } else if let Some(target) = target_version.filter(|s| !s.is_empty()) {
+                // 版本项可能尚未刷新；作业成功且版本未回读时先认成功
+                match after.as_deref() {
+                    Some(v) => v == target || v.contains(target),
+                    None => true,
+                }
             } else {
-                overall == "success"
+                true
             }
         }
         _ => overall == "success",
@@ -323,6 +370,21 @@ async fn process_host(
         .bind(host_id)
         .execute(pool)
         .await?;
+        if matches!(action, "upgrade" | "rollback") {
+            if let Some(pkg) = package_id.map(str::trim).filter(|s| !s.is_empty()) {
+                let _ = sqlx::query(
+                    "UPDATE zbx_host_links SET package_id = ?, agent_version = COALESCE(?, agent_version), \
+                     synced_at = UTC_TIMESTAMP() \
+                     WHERE instance_code = ? AND host_id = ?",
+                )
+                .bind(pkg)
+                .bind(&after)
+                .bind(instance_code)
+                .bind(host_id)
+                .execute(pool)
+                .await;
+            }
+        }
     } else {
         let msg = format!("作业状态={overall}，版本前={:?}，版本后={:?}", before, after);
         sqlx::query(
@@ -347,16 +409,39 @@ async fn run_install(
     concurrency: usize,
 ) -> anyhow::Result<()> {
     let task = sqlx::query(
-        "SELECT server_addr, server_active, group_ids, template_ids FROM zbx_tasks WHERE id = ?",
+        "SELECT server_addr, agent_port, server_active, proxy_id, proxy_group_id, package_id, install_path, conf_suffix, \
+                group_ids, template_ids FROM zbx_tasks WHERE id = ?",
     )
     .bind(task_id)
     .fetch_one(pool)
     .await?;
-    let server: String = task.try_get("server_addr")?;
+    let server: String = task
+        .try_get::<Option<String>, _>("server_addr")?
+        .unwrap_or_default();
+    let agent_port: String = task
+        .try_get::<Option<String>, _>("agent_port")?
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "10050".to_string());
     let server_active: String = task
         .try_get::<Option<String>, _>("server_active")?
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| server.clone());
+    let proxy_id: String = task
+        .try_get::<Option<String>, _>("proxy_id")?
+        .unwrap_or_default();
+    let proxy_group_id: String = task
+        .try_get::<Option<String>, _>("proxy_group_id")?
+        .unwrap_or_default();
+    let package_id: String = task
+        .try_get::<Option<String>, _>("package_id")?
+        .unwrap_or_default();
+    let install_path: String = task
+        .try_get::<Option<String>, _>("install_path")?
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/opt/ITM/IIM/zabbix_agentd".to_string());
+    let conf_suffix: String = task
+        .try_get::<Option<String>, _>("conf_suffix")?
+        .unwrap_or_default();
     let group_ids = parse_id_list(task.try_get::<Option<String>, _>("group_ids")?.as_deref());
     let template_ids = parse_id_list(task.try_get::<Option<String>, _>("template_ids")?.as_deref());
     let rows = sqlx::query(
@@ -436,7 +521,13 @@ async fn run_install(
         let task_id = task_id.to_string();
         let instance_code = instance_code.to_string();
         let server = server.clone();
+        let agent_port = agent_port.clone();
         let server_active = server_active.clone();
+        let proxy_id = proxy_id.clone();
+        let proxy_group_id = proxy_group_id.clone();
+        let package_id = package_id.clone();
+        let install_path = install_path.clone();
+        let conf_suffix = conf_suffix.clone();
         let group_ids = group_ids.clone();
         let template_ids = template_ids.clone();
         let ci_id = ci.id.clone();
@@ -449,7 +540,13 @@ async fn run_install(
                 &placeholder,
                 &ci,
                 &server,
+                &agent_port,
                 &server_active,
+                &proxy_id,
+                &proxy_group_id,
+                &package_id,
+                &install_path,
+                &conf_suffix,
                 &group_ids,
                 &template_ids,
                 job_id,
@@ -532,7 +629,13 @@ async fn process_install_host(
     placeholder: &str,
     ci: &InstallCi,
     server: &str,
+    agent_port: &str,
     server_active: &str,
+    proxy_id: &str,
+    proxy_group_id: &str,
+    package_id: &str,
+    install_path: &str,
+    conf_suffix: &str,
     group_ids: &[String],
     template_ids: &[String],
     job_id: Option<i64>,
@@ -554,11 +657,36 @@ async fn process_install_host(
     let Some(job_client) = job_client else {
         anyhow::bail!("作业客户端不可用，检查 MERIDIANOPS_JOB_TOKEN");
     };
-    let env = serde_json::json!({
-        "ZBX_SERVER": server,
-        "ZBX_SERVER_ACTIVE": server_active,
-        "ZBX_HOSTNAME": ci.hostname,
-    });
+    if package_id.trim().is_empty() {
+        anyhow::bail!("未指定 Agent 安装包");
+    }
+    let via_proxy = !proxy_id.trim().is_empty() || !proxy_group_id.trim().is_empty();
+    let mut env = serde_json::Map::new();
+    env.insert("ZBX_HOSTNAME".into(), serde_json::json!(ci.hostname));
+    env.insert("ZBX_PACKAGE_ID".into(), serde_json::json!(package_id.trim()));
+    env.insert("ZBX_INSTALL_PATH".into(), serde_json::json!(install_path.trim()));
+    if !conf_suffix.trim().is_empty() {
+        env.insert("ZBX_CONF_SUFFIX".into(), serde_json::json!(conf_suffix.trim()));
+    }
+    if !server.trim().is_empty() {
+        env.insert("ZBX_SERVER".into(), serde_json::json!(server.trim()));
+    }
+    if !server_active.trim().is_empty() {
+        env.insert(
+            "ZBX_SERVER_ACTIVE".into(),
+            serde_json::json!(server_active.trim()),
+        );
+    }
+    let listen_port = {
+        let p = agent_port.trim();
+        if p.is_empty() {
+            "10050"
+        } else {
+            p
+        }
+    };
+    env.insert("ZBX_LISTEN_PORT".into(), serde_json::json!(listen_port));
+    let env = serde_json::Value::Object(env);
     let run_id = job_client
         .execute_with_env(job_id, &ci.id, &env)
         .await
@@ -572,23 +700,33 @@ async fn process_install_host(
     .execute(pool)
     .await?;
     let overall = job_client
-        .wait_run(run_id, 600)
+        .wait_run(run_id, 900)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     if overall != "success" {
-        anyhow::bail!("安装作业状态={overall}。请检查包仓库、SSH 凭据，以及主机到 Zabbix Server 10051 是否可达");
+        if via_proxy {
+            anyhow::bail!("安装作业状态={overall}。请检查包下发、SSH 凭据、conf 模板，以及主机到 Proxy 是否可达");
+        }
+        anyhow::bail!("安装作业状态={overall}。请检查包下发、SSH 凭据与 conf 模板");
     }
 
     let writer = ZabbixClient::for_write(http.clone(), write_cfg)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let mut register_body = serde_json::json!({
+        "hostname": ci.hostname,
+        "displayName": ci.display_name,
+        "ip": ci.ip,
+        "port": listen_port,
+        "groupIds": group_ids,
+        "templateIds": template_ids,
+    });
+    if !proxy_group_id.trim().is_empty() {
+        register_body["proxyGroupId"] = serde_json::json!(proxy_group_id.trim());
+    } else if !proxy_id.trim().is_empty() {
+        register_body["proxyId"] = serde_json::json!(proxy_id.trim());
+    }
     let registered = writer
-        .register_host(&serde_json::json!({
-            "hostname": ci.hostname,
-            "displayName": ci.display_name,
-            "ip": ci.ip,
-            "groupIds": group_ids,
-            "templateIds": template_ids,
-        }))
+        .register_host(&register_body)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let host_id = registered["hostId"].as_str().unwrap_or("").to_string();
@@ -606,7 +744,8 @@ async fn process_install_host(
 
     let reader = ZabbixClient::new(http, read_cfg).map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let mut up = false;
-    for _ in 0..18 {
+    // 经 Proxy / Proxy Group 上报通常更慢，给约 5 分钟
+    for _ in 0..30 {
         sleep(Duration::from_secs(10)).await;
         if reader
             .agent_ping_up(&host_id)
@@ -618,19 +757,35 @@ async fn process_install_host(
         }
     }
     if !up {
-        anyhow::bail!("agent.ping 在 3 分钟内未通。安装已完成，但主机到 Zabbix Server 10051 可能不通");
+        if via_proxy {
+            anyhow::bail!("agent.ping 在 5 分钟内未通。安装与登记已完成，但经 Proxy/Proxy Group 未在时限内上报");
+        }
+        anyhow::bail!("agent.ping 在 5 分钟内未通。安装已完成，但主机到 Zabbix Server 10051 可能不通");
     }
     sqlx::query(
-        "INSERT INTO zbx_host_links (instance_code, host_id, hostname, ip, ci_id, agent_available, synced_at) \
-         VALUES (?, ?, ?, ?, ?, 1, UTC_TIMESTAMP()) \
+        "INSERT INTO zbx_host_links \
+         (instance_code, host_id, hostname, ip, ci_id, agent_available, install_path, package_id, conf_suffix, synced_at) \
+         VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, UTC_TIMESTAMP()) \
          ON DUPLICATE KEY UPDATE hostname = VALUES(hostname), ip = VALUES(ip), ci_id = VALUES(ci_id), \
-         agent_available = 1, synced_at = UTC_TIMESTAMP()",
+         agent_available = 1, install_path = VALUES(install_path), package_id = VALUES(package_id), \
+         conf_suffix = VALUES(conf_suffix), synced_at = UTC_TIMESTAMP()",
     )
     .bind(instance_code)
     .bind(&host_id)
     .bind(&ci.hostname)
     .bind(&ci.ip)
     .bind(&ci.id)
+    .bind(install_path)
+    .bind(if package_id.trim().is_empty() {
+        None::<&str>
+    } else {
+        Some(package_id.trim())
+    })
+    .bind(if conf_suffix.trim().is_empty() {
+        None::<&str>
+    } else {
+        Some(conf_suffix.trim())
+    })
     .execute(pool)
     .await?;
     sqlx::query(
@@ -651,9 +806,9 @@ fn parse_id_list(raw: Option<&str>) -> Vec<String> {
 async fn finish_task(pool: &DbPool, task_id: &str) -> anyhow::Result<()> {
     let counts = sqlx::query(
         "SELECT \
-            SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END) AS ok_n, \
-            SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS fail_n, \
-            COUNT(*) AS total_n \
+            CAST(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END) AS SIGNED) AS ok_n, \
+            CAST(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS SIGNED) AS fail_n, \
+            CAST(COUNT(*) AS SIGNED) AS total_n \
          FROM zbx_task_hosts WHERE task_id = ?",
     )
     .bind(task_id)
@@ -689,7 +844,13 @@ pub async fn create_install_task(
     group_ids: &[String],
     template_ids: &[String],
     server: &str,
+    agent_port: &str,
     server_active: &str,
+    proxy_id: &str,
+    proxy_group_id: &str,
+    package_id: &str,
+    install_path: &str,
+    conf_suffix: &str,
     concurrency: i32,
     requested_by: &str,
 ) -> anyhow::Result<String> {
@@ -702,22 +863,86 @@ pub async fn create_install_task(
     if template_ids.is_empty() {
         anyhow::bail!("请选择模板");
     }
-    if server.trim().is_empty() {
-        anyhow::bail!("请填写 Zabbix Server 地址");
+    let package_id = package_id.trim();
+    if package_id.is_empty() {
+        anyhow::bail!("请选择 Agent 安装包");
+    }
+    let conf_suffix = conf_suffix.trim();
+    if server.trim().is_empty() && conf_suffix.is_empty() {
+        anyhow::bail!("请填写 Server 地址，或指定 conf 模板后缀");
+    }
+    if server.trim().len() > 1024 || server_active.trim().len() > 1024 {
+        anyhow::bail!("Server / ServerActive 地址过长");
+    }
+    let agent_port = {
+        let p = agent_port.trim();
+        if p.is_empty() {
+            "10050".to_string()
+        } else {
+            let n: u16 = p
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Agent 端口无效"))?;
+            if n == 0 {
+                anyhow::bail!("Agent 端口无效");
+            }
+            n.to_string()
+        }
+    };
+    let install_path = install_path.trim();
+    if install_path.is_empty() || !install_path.starts_with('/') || install_path.contains("..") {
+        anyhow::bail!("安装目录无效");
+    }
+    let proxy_id = proxy_id.trim();
+    let proxy_group_id = proxy_group_id.trim();
+    if !proxy_id.is_empty() && !proxy_group_id.is_empty() {
+        anyhow::bail!("不能同时指定 Proxy 与 Proxy Group");
+    }
+    if !proxy_id.is_empty() && !proxy_id.chars().all(|c| c.is_ascii_digit()) {
+        anyhow::bail!("Proxy ID 无效");
+    }
+    if !proxy_group_id.is_empty() && !proxy_group_id.chars().all(|c| c.is_ascii_digit()) {
+        anyhow::bail!("Proxy Group ID 无效");
     }
     if !cfg.zabbix.iter().any(|z| z.enabled && z.code == instance_code) {
         anyhow::bail!("未找到 Zabbix 实例 {instance_code}");
     }
     let task_id = Uuid::new_v4().to_string();
     sqlx::query(
-        "INSERT INTO zbx_tasks (id, instance_code, action, server_addr, server_active, group_ids, template_ids, \
+        "INSERT INTO zbx_tasks (id, instance_code, action, server_addr, agent_port, server_active, proxy_id, proxy_group_id, \
+                package_id, install_path, conf_suffix, group_ids, template_ids, \
                 concurrency, status, requested_by, created_at) \
-         VALUES (?, ?, 'install', ?, ?, ?, ?, ?, 'pending', ?, UTC_TIMESTAMP())",
+         VALUES (?, ?, 'install', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, UTC_TIMESTAMP())",
     )
     .bind(&task_id)
     .bind(instance_code)
-    .bind(server.trim())
-    .bind(if server_active.trim().is_empty() { server.trim() } else { server_active.trim() })
+    .bind(if server.trim().is_empty() {
+        None::<&str>
+    } else {
+        Some(server.trim())
+    })
+    .bind(&agent_port)
+    .bind(if server_active.trim().is_empty() {
+        if server.trim().is_empty() {
+            None::<&str>
+        } else {
+            Some(server.trim())
+        }
+    } else {
+        Some(server_active.trim())
+    })
+    .bind(if proxy_id.is_empty() { None::<&str> } else { Some(proxy_id) })
+    .bind(if proxy_group_id.is_empty() {
+        None::<&str>
+    } else {
+        Some(proxy_group_id)
+    })
+    .bind(package_id)
+    .bind(install_path)
+    .bind(if conf_suffix.is_empty() {
+        None::<&str>
+    } else {
+        Some(conf_suffix)
+    })
     .bind(serde_json::to_string(group_ids)?)
     .bind(serde_json::to_string(template_ids)?)
     .bind(concurrency.clamp(1, 50))
@@ -749,6 +974,7 @@ pub async fn create_task(
     action: &str,
     host_ids: &[String],
     target_version: Option<&str>,
+    package_id: Option<&str>,
     concurrency: i32,
     requested_by: &str,
 ) -> anyhow::Result<String> {
@@ -762,19 +988,21 @@ pub async fn create_task(
     if !cfg.zabbix.iter().any(|z| z.enabled && z.code == instance_code) {
         anyhow::bail!("未找到 Zabbix 实例 {instance_code}");
     }
-    if matches!(action, "upgrade" | "rollback") && target_version.unwrap_or("").is_empty() {
-        anyhow::bail!("升级/回滚必须指定 targetVersion");
+    let package_id = package_id.map(str::trim).filter(|s| !s.is_empty());
+    if matches!(action, "upgrade" | "rollback") && package_id.is_none() {
+        anyhow::bail!("升级/回滚必须指定 packageId");
     }
 
     let task_id = Uuid::new_v4().to_string();
     sqlx::query(
-        "INSERT INTO zbx_tasks (id, instance_code, action, target_version, concurrency, status, requested_by, created_at) \
-         VALUES (?, ?, ?, ?, ?, 'pending', ?, UTC_TIMESTAMP())",
+        "INSERT INTO zbx_tasks (id, instance_code, action, target_version, package_id, concurrency, status, requested_by, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, UTC_TIMESTAMP())",
     )
     .bind(&task_id)
     .bind(instance_code)
     .bind(action)
-    .bind(target_version)
+    .bind(target_version.filter(|s| !s.is_empty()))
+    .bind(package_id)
     .bind(concurrency.clamp(1, 50))
     .bind(requested_by)
     .execute(pool)
