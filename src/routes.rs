@@ -142,6 +142,10 @@ struct HostListQuery {
     group_id: Option<String>,
     /// online / offline / unknown
     agent: Option<String>,
+    /// running / stopped / absent / unknown（代理生命周期）
+    agent_status: Option<String>,
+    /// unavailable：任一接口类型 status=2
+    availability: Option<String>,
     /// linked / unlinked
     cmdb: Option<String>,
     /// 0 启用 / 1 禁用；空=全部
@@ -176,6 +180,9 @@ async fn list_hosts(
     }
     let total = hosts.len();
     let groups = group_counts(&hosts);
+    // 汇总：在 agentStatus 筛选前统计，点击卡片筛选时数字保持稳定
+    let base_for_summary = filter_roster_except_agent_status(&hosts, &q);
+    let agent_summary = agent_status_summary(&base_for_summary);
     let matched_rows = filter_roster(&hosts, &q);
     let matched = matched_rows.len();
     let page_size = q.page_size.unwrap_or(20).clamp(1, 100);
@@ -196,6 +203,7 @@ async fn list_hosts(
             "page": page,
             "pageSize": page_size,
             "groups": groups,
+            "agentSummary": agent_summary,
             "items": items,
         }
     })))
@@ -229,6 +237,21 @@ fn group_counts(hosts: &[serde_json::Value]) -> Vec<serde_json::Value> {
 }
 
 fn filter_roster(hosts: &[serde_json::Value], q: &HostListQuery) -> Vec<serde_json::Value> {
+    filter_roster_inner(hosts, q, true)
+}
+
+fn filter_roster_except_agent_status(
+    hosts: &[serde_json::Value],
+    q: &HostListQuery,
+) -> Vec<serde_json::Value> {
+    filter_roster_inner(hosts, q, false)
+}
+
+fn filter_roster_inner(
+    hosts: &[serde_json::Value],
+    q: &HostListQuery,
+    apply_agent_status: bool,
+) -> Vec<serde_json::Value> {
     let search = q
         .search
         .as_deref()
@@ -237,6 +260,16 @@ fn filter_roster(hosts: &[serde_json::Value], q: &HostListQuery) -> Vec<serde_js
         .map(|s| s.to_lowercase());
     let group_id = q.group_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let agent = q.agent.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let agent_status = q
+        .agent_status
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let availability = q
+        .availability
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     let cmdb = q.cmdb.as_deref().map(str::trim).filter(|s| !s.is_empty());
     hosts
         .iter()
@@ -272,6 +305,25 @@ fn filter_roster(hosts: &[serde_json::Value], q: &HostListQuery) -> Vec<serde_js
                     return false;
                 }
             }
+            if apply_agent_status {
+                if let Some(flag) = agent_status {
+                    let st = host["agentStatus"].as_str().unwrap_or("unknown");
+                    if st != flag {
+                        return false;
+                    }
+                }
+            }
+            if let Some(flag) = availability {
+                let ok = match flag {
+                    "unavailable" => host_has_unavailable_iface(host),
+                    "available" => host_all_ifaces_available(host),
+                    "unknown" => host_has_unknown_iface(host),
+                    _ => true,
+                };
+                if !ok {
+                    return false;
+                }
+            }
             if let Some(flag) = cmdb {
                 let linked = host["cmdbLinked"].as_bool().unwrap_or(false);
                 let ok = match flag {
@@ -300,6 +352,59 @@ fn filter_roster(hosts: &[serde_json::Value], q: &HostListQuery) -> Vec<serde_js
         .collect()
 }
 
+fn agent_status_summary(hosts: &[serde_json::Value]) -> serde_json::Value {
+    let mut running = 0usize;
+    let mut stopped = 0usize;
+    let mut absent = 0usize;
+    let mut unknown = 0usize;
+    for host in hosts {
+        match host["agentStatus"].as_str().unwrap_or("unknown") {
+            "running" => running += 1,
+            "stopped" => stopped += 1,
+            "absent" => absent += 1,
+            _ => unknown += 1,
+        }
+    }
+    json!({
+        "running": running,
+        "stopped": stopped,
+        "absent": absent,
+        "unknown": unknown,
+    })
+}
+
+fn iface_status(avail: &serde_json::Value, key: &str) -> Option<i64> {
+    let node = &avail[key];
+    if node.is_null() {
+        return None;
+    }
+    node["status"]
+        .as_i64()
+        .or_else(|| node.as_i64())
+        .or_else(|| node.as_u64().map(|n| n as i64))
+}
+
+fn host_iface_statuses(host: &serde_json::Value) -> Vec<i64> {
+    let avail = &host["availability"];
+    ["zbx", "snmp", "ipmi", "jmx"]
+        .iter()
+        .filter_map(|k| iface_status(avail, k))
+        .collect()
+}
+
+fn host_has_unavailable_iface(host: &serde_json::Value) -> bool {
+    host_iface_statuses(host).iter().any(|&s| s == 2)
+}
+
+fn host_all_ifaces_available(host: &serde_json::Value) -> bool {
+    let statuses = host_iface_statuses(host);
+    !statuses.is_empty() && statuses.iter().all(|&s| s == 1)
+}
+
+fn host_has_unknown_iface(host: &serde_json::Value) -> bool {
+    host_iface_statuses(host).iter().any(|&s| s == 0)
+}
+
 async fn enrich_hosts_with_links(
     pool: &crate::db::DbPool,
     instance_code: &str,
@@ -307,8 +412,11 @@ async fn enrich_hosts_with_links(
 ) -> Result<(), AppError> {
     use sqlx::Row;
     let rows = sqlx::query(
-        "SELECT host_id, ci_id, install_path, package_id, conf_suffix \
-         FROM zbx_host_links WHERE instance_code = ?",
+        "SELECT l.host_id, l.ci_id, l.install_path, l.package_id, l.conf_suffix, \
+                c.ssh_credential_id \
+         FROM zbx_host_links l \
+         LEFT JOIN ci_instances c ON c.id = l.ci_id \
+         WHERE l.instance_code = ?",
     )
     .bind(instance_code)
     .fetch_all(pool)
@@ -321,15 +429,23 @@ async fn enrich_hosts_with_links(
         let install_path: Option<String> = r.try_get("install_path").ok().flatten();
         let package_id: Option<String> = r.try_get("package_id").ok().flatten();
         let conf_suffix: Option<String> = r.try_get("conf_suffix").ok().flatten();
-        map.insert(host_id, (ci_id, install_path, package_id, conf_suffix));
+        let ssh_cred: Option<i64> = r.try_get("ssh_credential_id").ok().flatten();
+        map.insert(
+            host_id,
+            (ci_id, install_path, package_id, conf_suffix, ssh_cred),
+        );
     }
     for h in hosts.iter_mut() {
         let id = h["hostId"].as_str().unwrap_or("").to_string();
-        if let Some((ci_id, install_path, package_id, conf_suffix)) = map.get(&id) {
+        if let Some((ci_id, install_path, package_id, conf_suffix, ssh_cred)) = map.get(&id) {
             h["ciId"] = json!(ci_id);
             h["installPath"] = json!(install_path);
             h["packageId"] = json!(package_id);
             h["confSuffix"] = json!(conf_suffix);
+            h["sshCredentialId"] = json!(ssh_cred);
+            h["sshCredentialBound"] = json!(ssh_cred.is_some());
+        } else {
+            h["sshCredentialBound"] = json!(false);
         }
         h["cmdbLinked"] = json!(h["ciId"].as_str().map(|s| !s.is_empty()).unwrap_or(false));
     }

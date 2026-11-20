@@ -72,7 +72,10 @@ impl ZabbixClient {
     ) -> Result<Vec<Value>, AppError> {
         let mut params = json!({
             "output": ["hostid", "host", "name", "status"],
-            "selectInterfaces": ["ip", "dns", "port", "type", "main", "available"],
+            "selectInterfaces": [
+                "ip", "dns", "port", "type", "main",
+                "available", "error", "errors_from", "disable_until"
+            ],
             "selectHostGroups": ["groupid", "name"],
             "filter": { "status": 0 },
             "sortfield": "host",
@@ -109,7 +112,10 @@ impl ZabbixClient {
     pub async fn hosts_light(&self, status_filter: Option<i64>) -> Result<Vec<Value>, AppError> {
         let mut params = json!({
             "output": ["hostid", "host", "name", "status"],
-            "selectInterfaces": ["ip", "dns", "port", "type", "main", "available"],
+            "selectInterfaces": [
+                "ip", "dns", "port", "type", "main",
+                "available", "error", "errors_from", "disable_until"
+            ],
             "selectHostGroups": ["groupid", "name"],
             "sortfield": "host",
         });
@@ -122,7 +128,8 @@ impl ZabbixClient {
     }
 
     /// 只给当前页补 agent.version / agent.ping，避免全量 item.get。
-    /// 名册通断以 agent.ping 为准（经 Proxy 时接口 available 常不准）。
+    /// Agent 通断：看 ping 项 state/lastvalue，且 ZBX 接口不可用时强制为断（避免 lastvalue 残留 1）。
+    /// 接口「可用性」徽章仍用 availability.*，不在此改。
     pub async fn attach_agent_versions(&self, hosts: &mut [Value]) -> Result<(), AppError> {
         let ids: Vec<String> = hosts
             .iter()
@@ -138,15 +145,18 @@ impl ZabbixClient {
         for host in hosts.iter_mut() {
             let id = host["hostId"].as_str().unwrap_or("").to_string();
             let version = last_value(&items, &id, &["agent.version"]);
-            let ping = last_value(&items, &id, &["agent.ping"]);
             if let Some(version) = version {
                 host["agentVersion"] = json!(version);
             }
-            match ping.as_deref() {
-                Some("1") => host["agentAvailable"] = json!(true),
-                Some("0") => host["agentAvailable"] = json!(false),
-                _ => {}
+            let ping_item = pick_item(&items, &id, &["agent.ping"]);
+            let zbx_iface = mapped_zbx_iface_available(host);
+            if let Some(available) = resolve_agent_available(ping_item, zbx_iface) {
+                host["agentAvailable"] = json!(available);
             }
+            host["agentStatus"] = json!(agent_status_code(
+                mapped_has_agent_iface(host),
+                host["agentAvailable"].as_bool(),
+            ));
         }
         Ok(())
     }
@@ -469,7 +479,10 @@ impl ZabbixClient {
                 .call(
                     "item.get",
                     json!({
-                        "output": ["itemid", "hostid", "key_", "lastvalue", "value_type"],
+                        "output": [
+                            "itemid", "hostid", "key_", "lastvalue", "lastclock",
+                            "value_type", "state", "status", "error"
+                        ],
                         "hostids": chunk,
                         "monitored": true,
                         "filter": { "key_": keys },
@@ -2419,12 +2432,18 @@ fn map_host(host: &Value, items: &[Value]) -> Value {
     let ip = primary_ip(host);
     let port = primary_port(host);
     let version = last_value(items, host_id, &["agent.version"]);
-    let ping = last_value(items, host_id, &["agent.ping"]);
-    let available = interface_available(host).or_else(|| match ping.as_deref() {
-        Some("1") => Some(true),
-        Some("0") => Some(false),
-        _ => None,
-    });
+    let ping_item = pick_item(items, host_id, &["agent.ping"]);
+    // 可用性：按接口类型给出 Zabbix 同款状态码（0 未知 / 1 可用 / 2 不可用；无该类型则为 null）
+    let availability = host_availability_by_type(host);
+    let interface_available = primary_interface_available(host);
+    // Agent 通断：ping 项 state/lastvalue + ZBX 接口；接口已红时不因 lastvalue=1 仍显示通
+    let agent_available =
+        resolve_agent_available(ping_item, agent_interface_available(host));
+    let has_agent_iface = agent_interface_available(host).is_some()
+        || host["interfaces"]
+            .as_array()
+            .is_some_and(|list| list.iter().any(|i| iface_type_is(i, 1)));
+    let agent_status = agent_status_code(has_agent_iface, agent_available);
     let status = host["status"]
         .as_str()
         .map(|s| s.to_string())
@@ -2437,7 +2456,10 @@ fn map_host(host: &Value, items: &[Value]) -> Value {
         "status": status,
         "ip": ip,
         "port": port,
-        "agentAvailable": available,
+        "agentAvailable": agent_available,
+        "agentStatus": agent_status,
+        "interfaceAvailable": interface_available,
+        "availability": availability,
         "agentVersion": version,
         "groups": map_id_names(&host["hostgroups"], "groupid", "groupId"),
     })
@@ -2481,14 +2503,173 @@ fn primary_port(host: &Value) -> String {
         .unwrap_or_default()
 }
 
-fn interface_available(host: &Value) -> Option<bool> {
-    let list = host["interfaces"].as_array()?;
-    let agent = list.iter().find(|i| i["type"].as_str() == Some("1"))?;
-    match agent["available"].as_str() {
-        Some("1") => Some(true),
-        Some("2") => Some(false),
+fn iface_available_code(iface: &Value) -> i64 {
+    let Some(raw) = iface.get("available") else {
+        return 0;
+    };
+    let code = raw
+        .as_i64()
+        .or_else(|| raw.as_u64().map(|n| n as i64))
+        .or_else(|| raw.as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or(0);
+    match code {
+        1 | 2 => code,
+        _ => 0,
+    }
+}
+
+fn iface_available_flag(iface: &Value) -> Option<bool> {
+    match iface_available_code(iface) {
+        1 => Some(true),
+        2 => Some(false),
         _ => None,
     }
+}
+
+fn iface_ts(iface: &Value, key: &str) -> i64 {
+    iface
+        .get(key)
+        .and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_u64().map(|n| n as i64))
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
+        .unwrap_or(0)
+}
+
+fn iface_availability_detail(iface: &Value) -> Value {
+    json!({
+        "status": iface_available_code(iface),
+        "error": iface["error"].as_str().unwrap_or(""),
+        "errorsFrom": iface_ts(iface, "errors_from"),
+        "disableUntil": iface_ts(iface, "disable_until"),
+    })
+}
+
+/// 与 Zabbix 前端一致：按类型取主接口（无主则取该类型第一张）的 available + error。
+fn host_availability_by_type(host: &Value) -> Value {
+    let empty = json!({
+        "zbx": Value::Null,
+        "snmp": Value::Null,
+        "ipmi": Value::Null,
+        "jmx": Value::Null,
+    });
+    let Some(list) = host["interfaces"].as_array() else {
+        return empty;
+    };
+    let pick = |ty: i64| -> Value {
+        let iface = list
+            .iter()
+            .filter(|i| iface_type_is(i, ty))
+            .find(|i| iface_is_main(i))
+            .or_else(|| list.iter().find(|i| iface_type_is(i, ty)));
+        match iface {
+            Some(i) => iface_availability_detail(i),
+            None => Value::Null,
+        }
+    };
+    json!({
+        "zbx": pick(1),
+        "snmp": pick(2),
+        "ipmi": pick(3),
+        "jmx": pick(4),
+    })
+}
+
+fn iface_is_main(iface: &Value) -> bool {
+    iface["main"].as_str() == Some("1") || iface["main"].as_i64() == Some(1)
+}
+
+fn iface_type_is(iface: &Value, ty: i64) -> bool {
+    iface["type"].as_i64() == Some(ty)
+        || iface["type"]
+            .as_str()
+            .and_then(|s| s.parse::<i64>().ok())
+            == Some(ty)
+}
+
+/// Zabbix 主机「可用性」：优先主接口，否则第一张接口（含 SNMP/IPMI/JMX）。
+fn primary_interface_available(host: &Value) -> Option<bool> {
+    let list = host["interfaces"].as_array()?;
+    let iface = list
+        .iter()
+        .find(|i| iface_is_main(i))
+        .or_else(|| list.first())?;
+    iface_available_flag(iface)
+}
+
+fn agent_interface_available(host: &Value) -> Option<bool> {
+    let list = host["interfaces"].as_array()?;
+    let agent = list.iter().find(|i| iface_type_is(i, 1))?;
+    iface_available_flag(agent)
+}
+
+/// 名册已映射主机上的 ZBX 接口通断（status 1/2）。
+fn mapped_zbx_iface_available(host: &Value) -> Option<bool> {
+    let node = &host["availability"]["zbx"];
+    let code = node["status"]
+        .as_i64()
+        .or_else(|| node.as_i64())
+        .or_else(|| node.as_u64().map(|n| n as i64))?;
+    match code {
+        1 => Some(true),
+        2 => Some(false),
+        _ => None,
+    }
+}
+
+fn mapped_has_agent_iface(host: &Value) -> bool {
+    !host["availability"]["zbx"].is_null()
+}
+
+/// 代理生命周期状态（一期）：
+/// - absent：无 Zabbix Agent 接口
+/// - running：有接口且通
+/// - stopped：有接口但不通（含停服与链路不可达，二期再拆）
+/// - unknown：有接口但通断未知
+fn agent_status_code(has_agent_iface: bool, available: Option<bool>) -> &'static str {
+    if !has_agent_iface {
+        return "absent";
+    }
+    match available {
+        Some(true) => "running",
+        Some(false) => "stopped",
+        None => "unknown",
+    }
+}
+
+fn item_state_code(item: &Value) -> i64 {
+    item.get("state")
+        .and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_u64().map(|n| n as i64))
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
+        .unwrap_or(0)
+}
+
+/// Agent 通断判定：
+/// 1) ZBX Agent 接口不可用 → 断（与可用性列一致，避免 lastvalue 残留）
+/// 2) agent.ping 监控项 state=1（不支持）→ 断
+/// 3) 否则看 lastvalue 1/0；都没有则回退接口状态
+fn resolve_agent_available(
+    ping_item: Option<&Value>,
+    zbx_iface_available: Option<bool>,
+) -> Option<bool> {
+    if zbx_iface_available == Some(false) {
+        return Some(false);
+    }
+    if let Some(item) = ping_item {
+        if item_state_code(item) == 1 {
+            return Some(false);
+        }
+        match item["lastvalue"].as_str() {
+            Some("1") => return Some(true),
+            Some("0") => return Some(false),
+            _ => {}
+        }
+    }
+    zbx_iface_available
 }
 
 fn last_value(items: &[Value], host_id: &str, keys: &[&str]) -> Option<String> {
