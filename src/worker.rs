@@ -295,7 +295,7 @@ async fn process_host(
     };
 
     let link = sqlx::query(
-        "SELECT install_path, package_id FROM zbx_host_links \
+        "SELECT install_path, package_id, proxy_id, proxy_group_id FROM zbx_host_links \
          WHERE instance_code = ? AND host_id = ?",
     )
     .bind(instance_code)
@@ -312,6 +312,23 @@ async fn process_host(
         "ZBX_INSTALL_PATH".into(),
         serde_json::json!(install_path),
     );
+    env.insert(
+        "ZBX_INSTANCE_CODE".into(),
+        serde_json::json!(instance_code),
+    );
+    // 对照表里的通道，供 Gateway 解析 SSH 跳板
+    if let Some(link) = link.as_ref() {
+        if let Ok(Some(pid)) = link.try_get::<Option<String>, _>("proxy_id") {
+            if !pid.trim().is_empty() {
+                env.insert("ZBX_PROXY_ID".into(), serde_json::json!(pid.trim()));
+            }
+        }
+        if let Ok(Some(gid)) = link.try_get::<Option<String>, _>("proxy_group_id") {
+            if !gid.trim().is_empty() {
+                env.insert("ZBX_PROXY_GROUP_ID".into(), serde_json::json!(gid.trim()));
+            }
+        }
+    }
     if matches!(action, "upgrade" | "rollback") {
         let pkg = package_id.map(str::trim).filter(|s| !s.is_empty()).unwrap_or("");
         if pkg.is_empty() {
@@ -665,6 +682,19 @@ async fn process_install_host(
     env.insert("ZBX_HOSTNAME".into(), serde_json::json!(ci.hostname));
     env.insert("ZBX_PACKAGE_ID".into(), serde_json::json!(package_id.trim()));
     env.insert("ZBX_INSTALL_PATH".into(), serde_json::json!(install_path.trim()));
+    env.insert(
+        "ZBX_INSTANCE_CODE".into(),
+        serde_json::json!(instance_code),
+    );
+    if !proxy_id.trim().is_empty() {
+        env.insert("ZBX_PROXY_ID".into(), serde_json::json!(proxy_id.trim()));
+    }
+    if !proxy_group_id.trim().is_empty() {
+        env.insert(
+            "ZBX_PROXY_GROUP_ID".into(),
+            serde_json::json!(proxy_group_id.trim()),
+        );
+    }
     if !conf_suffix.trim().is_empty() {
         env.insert("ZBX_CONF_SUFFIX".into(), serde_json::json!(conf_suffix.trim()));
     }
@@ -762,13 +792,25 @@ async fn process_install_host(
         }
         anyhow::bail!("agent.ping 在 5 分钟内未通。安装已完成，但主机到 Zabbix Server 10051 可能不通");
     }
+    let proxy_id_store = if proxy_id.trim().is_empty() {
+        None
+    } else {
+        Some(proxy_id.trim())
+    };
+    let proxy_group_id_store = if proxy_group_id.trim().is_empty() {
+        None
+    } else {
+        Some(proxy_group_id.trim())
+    };
     sqlx::query(
         "INSERT INTO zbx_host_links \
-         (instance_code, host_id, hostname, ip, ci_id, agent_available, install_path, package_id, conf_suffix, synced_at) \
-         VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, UTC_TIMESTAMP()) \
+         (instance_code, host_id, hostname, ip, ci_id, agent_available, install_path, package_id, conf_suffix, \
+          proxy_id, proxy_group_id, synced_at) \
+         VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, UTC_TIMESTAMP()) \
          ON DUPLICATE KEY UPDATE hostname = VALUES(hostname), ip = VALUES(ip), ci_id = VALUES(ci_id), \
          agent_available = 1, install_path = VALUES(install_path), package_id = VALUES(package_id), \
-         conf_suffix = VALUES(conf_suffix), synced_at = UTC_TIMESTAMP()",
+         conf_suffix = VALUES(conf_suffix), proxy_id = VALUES(proxy_id), proxy_group_id = VALUES(proxy_group_id), \
+         synced_at = UTC_TIMESTAMP()",
     )
     .bind(instance_code)
     .bind(&host_id)
@@ -786,6 +828,8 @@ async fn process_install_host(
     } else {
         Some(conf_suffix.trim())
     })
+    .bind(proxy_id_store)
+    .bind(proxy_group_id_store)
     .execute(pool)
     .await?;
     sqlx::query(
