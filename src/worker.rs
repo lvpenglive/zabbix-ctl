@@ -427,7 +427,7 @@ async fn run_install(
 ) -> anyhow::Result<()> {
     let task = sqlx::query(
         "SELECT server_addr, agent_port, server_active, proxy_id, proxy_group_id, package_id, install_path, conf_suffix, \
-                group_ids, template_ids FROM zbx_tasks WHERE id = ?",
+                disable_host, group_ids, template_ids FROM zbx_tasks WHERE id = ?",
     )
     .bind(task_id)
     .fetch_one(pool)
@@ -459,6 +459,7 @@ async fn run_install(
     let conf_suffix: String = task
         .try_get::<Option<String>, _>("conf_suffix")?
         .unwrap_or_default();
+    let disable_host: bool = task.try_get::<i8, _>("disable_host").unwrap_or(0) == 1;
     let group_ids = parse_id_list(task.try_get::<Option<String>, _>("group_ids")?.as_deref());
     let template_ids = parse_id_list(task.try_get::<Option<String>, _>("template_ids")?.as_deref());
     let rows = sqlx::query(
@@ -566,6 +567,7 @@ async fn run_install(
                 &conf_suffix,
                 &group_ids,
                 &template_ids,
+                disable_host,
                 job_id,
                 job_client.as_ref(),
                 http,
@@ -655,6 +657,7 @@ async fn process_install_host(
     conf_suffix: &str,
     group_ids: &[String],
     template_ids: &[String],
+    disable_host: bool,
     job_id: Option<i64>,
     job_client: Option<&JobClient>,
     http: reqwest::Client,
@@ -792,6 +795,13 @@ async fn process_install_host(
         }
         anyhow::bail!("agent.ping 在 5 分钟内未通。安装已完成，但主机到 Zabbix Server 10051 可能不通");
     }
+    // 验证通后再禁用，避免安装阶段无法做 agent.ping，同时防止立刻告警
+    if disable_host {
+        writer
+            .set_host_status(&host_id, 1)
+            .await
+            .map_err(|e| anyhow::anyhow!("验证通过但禁用主机失败: {e}"))?;
+    }
     let proxy_id_store = if proxy_id.trim().is_empty() {
         None
     } else {
@@ -895,6 +905,7 @@ pub async fn create_install_task(
     package_id: &str,
     install_path: &str,
     conf_suffix: &str,
+    disable_host: bool,
     concurrency: i32,
     requested_by: &str,
 ) -> anyhow::Result<String> {
@@ -953,9 +964,9 @@ pub async fn create_install_task(
     let task_id = Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO zbx_tasks (id, instance_code, action, server_addr, agent_port, server_active, proxy_id, proxy_group_id, \
-                package_id, install_path, conf_suffix, group_ids, template_ids, \
+                package_id, install_path, conf_suffix, disable_host, group_ids, template_ids, \
                 concurrency, status, requested_by, created_at) \
-         VALUES (?, ?, 'install', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, UTC_TIMESTAMP())",
+         VALUES (?, ?, 'install', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, UTC_TIMESTAMP())",
     )
     .bind(&task_id)
     .bind(instance_code)
@@ -987,6 +998,7 @@ pub async fn create_install_task(
     } else {
         Some(conf_suffix)
     })
+    .bind(if disable_host { 1i8 } else { 0i8 })
     .bind(serde_json::to_string(group_ids)?)
     .bind(serde_json::to_string(template_ids)?)
     .bind(concurrency.clamp(1, 50))

@@ -711,6 +711,9 @@ struct CreateTaskRequest {
     package_id: Option<String>,
     install_path: Option<String>,
     conf_suffix: Option<String>,
+    /// 安装验证 agent.ping 通过后禁用主机，避免立刻告警
+    #[serde(default)]
+    disable_after_install: Option<bool>,
 }
 
 async fn list_proxies(
@@ -774,6 +777,7 @@ async fn create_task(
             req.package_id.as_deref().unwrap_or(""),
             req.install_path.as_deref().unwrap_or("/opt/ITM/IIM/zabbix_agentd"),
             req.conf_suffix.as_deref().unwrap_or(""),
+            req.disable_after_install.unwrap_or(false),
             concurrency,
             requested_by,
         )

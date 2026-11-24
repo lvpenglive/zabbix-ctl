@@ -555,6 +555,20 @@ impl ZabbixClient {
         Ok(last_value(&items, host_id, &["agent.ping"]).as_deref() == Some("1"))
     }
 
+    /// 启用(0) / 禁用(1) Zabbix 主机监控状态。
+    pub async fn set_host_status(&self, host_id: &str, status: i64) -> Result<(), AppError> {
+        require_zbx_id(host_id)?;
+        if status != 0 && status != 1 {
+            return Err(AppError::bad("主机 status 仅支持 0 或 1"));
+        }
+        self.call(
+            "host.update",
+            json!({ "hostid": host_id, "status": status }),
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn find_existing_host(&self, hostname: &str, ip: &str) -> Result<Option<String>, AppError> {
         let by_name = if hostname.is_empty() {
             None
