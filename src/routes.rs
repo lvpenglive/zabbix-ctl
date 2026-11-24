@@ -788,7 +788,9 @@ async fn create_task(
             req.proxy_id.as_deref().unwrap_or(""),
             req.proxy_group_id.as_deref().unwrap_or(""),
             req.package_id.as_deref().unwrap_or(""),
-            req.install_path.as_deref().unwrap_or("/opt/ITM/IIM/zabbix_agentd"),
+            req.install_path
+                .as_deref()
+                .unwrap_or(state.config.meridianops.resolved_default_install_path()),
             req.conf_suffix.as_deref().unwrap_or(""),
             req.disable_after_install.unwrap_or(false),
             concurrency,

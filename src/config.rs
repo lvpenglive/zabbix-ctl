@@ -53,12 +53,19 @@ impl Default for DatabaseConfig {
     }
 }
 
+/// 未配置 `default_install_path` 或配置为空时使用的 Zabbix Agent 安装目录。
+pub const DEFAULT_INSTALL_PATH: &str = "/opt/ITM/IIM/zabbix_agentd";
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct MeridianOpsConfig {
     pub base_url: String,
     /// 调 Gateway 作业接口的 API Token（mk- 前缀）。环境变量 MERIDIANOPS_JOB_TOKEN 可覆盖。
     pub job_token: String,
+    /// Zabbix Agent 默认安装目录。主机对照或安装任务未指定 install_path 时使用；
+    /// 留空则回退内置默认值 DEFAULT_INSTALL_PATH。
+    #[serde(default)]
+    pub default_install_path: String,
     pub job_start: i64,
     pub job_stop: i64,
     pub job_restart: i64,
@@ -85,6 +92,7 @@ impl Default for MeridianOpsConfig {
         Self {
             base_url: "http://127.0.0.1:8800".to_string(),
             job_token: String::new(),
+            default_install_path: String::new(),
             job_start: 0,
             job_stop: 0,
             job_restart: 0,
@@ -133,6 +141,15 @@ impl MeridianOpsConfig {
             None
         } else {
             Some(name)
+        }
+    }
+
+    /// 全局默认安装目录；未配置或为空时回退内置默认值。
+    pub fn resolved_default_install_path(&self) -> &str {
+        if self.default_install_path.is_empty() {
+            DEFAULT_INSTALL_PATH
+        } else {
+            self.default_install_path.as_str()
         }
     }
 
@@ -245,3 +262,34 @@ pub fn load(path: &Path) -> anyhow::Result<AppConfig> {
     }
     Ok(cfg)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_install_path_falls_back_to_builtin() {
+        let cfg: AppConfig = toml::from_str("[server]").unwrap();
+        assert_eq!(
+            cfg.meridianops.resolved_default_install_path(),
+            DEFAULT_INSTALL_PATH
+        );
+
+        let cfg: AppConfig =
+            toml::from_str("[server]\n[meridianops]\ndefault_install_path = \"\"").unwrap();
+        assert_eq!(
+            cfg.meridianops.resolved_default_install_path(),
+            DEFAULT_INSTALL_PATH
+        );
+
+        let cfg: AppConfig = toml::from_str(
+            "[server]\n[meridianops]\ndefault_install_path = \"/opt/custom/zabbix\"",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.meridianops.resolved_default_install_path(),
+            "/opt/custom/zabbix"
+        );
+    }
+}
+

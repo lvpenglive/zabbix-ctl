@@ -14,6 +14,8 @@ max_connections = 5
 base_url = "http://127.0.0.1:8800"
 # 调 Gateway 作业用的 mk- API 令牌；只读联调可留空
 job_token = ""
+# Agent 默认安装目录：主机对照或安装任务未单独指定 install_path 时使用。留空则用内置 /opt/ITM/IIM/zabbix_agentd
+default_install_path = "/opt/ITM/IIM/zabbix_agentd"
 # 作业定义 ID，0 表示按下方名称从 job_definitions 自动匹配
 job_start = 0
 job_stop = 0

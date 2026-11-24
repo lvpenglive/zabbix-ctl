@@ -132,6 +132,11 @@ async fn run_task(
         .await?;
 
     let job_id = resolve_job_id(pool, &state.config.meridianops, action).await?;
+    let default_install_path = state
+        .config
+        .meridianops
+        .resolved_default_install_path()
+        .to_string();
     let job_client = match (&job_id, MeridianOpsConfigExt::try_job_client(state)) {
         (Some(_), Ok(c)) => Some(c),
         (Some(_), Err(e)) => {
@@ -158,6 +163,7 @@ async fn run_task(
             .unwrap();
         let action = action.to_string();
         let instance_code = instance_code.to_string();
+        let default_install_path = default_install_path.clone();
         let target_version = target_version.map(|s| s.to_string());
         let package_id = package_id.map(|s| s.to_string());
         let job_id = job_id;
@@ -174,6 +180,7 @@ async fn run_task(
                 &action,
                 target_version.as_deref(),
                 package_id.as_deref(),
+                default_install_path.as_str(),
                 job_id,
                 job_client.as_ref(),
                 zbx_http,
@@ -267,6 +274,7 @@ async fn process_host(
     action: &str,
     target_version: Option<&str>,
     package_id: Option<&str>,
+    default_install_path: &str,
     job_id: Option<i64>,
     job_client: Option<&JobClient>,
     http: reqwest::Client,
@@ -306,7 +314,7 @@ async fn process_host(
         .as_ref()
         .and_then(|r| r.try_get::<Option<String>, _>("install_path").ok().flatten())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "/opt/ITM/IIM/zabbix_agentd".to_string());
+        .unwrap_or_else(|| default_install_path.to_string());
     let mut env = serde_json::Map::new();
     env.insert(
         "ZBX_INSTALL_PATH".into(),
@@ -455,7 +463,13 @@ async fn run_install(
     let install_path: String = task
         .try_get::<Option<String>, _>("install_path")?
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "/opt/ITM/IIM/zabbix_agentd".to_string());
+        .unwrap_or_else(|| {
+            state
+                .config
+                .meridianops
+                .resolved_default_install_path()
+                .to_string()
+        });
     let conf_suffix: String = task
         .try_get::<Option<String>, _>("conf_suffix")?
         .unwrap_or_default();
