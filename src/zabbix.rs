@@ -71,7 +71,7 @@ impl ZabbixClient {
         search: Option<&str>,
     ) -> Result<Vec<Value>, AppError> {
         let mut params = json!({
-            "output": ["hostid", "host", "name", "status"],
+            "output": self.host_list_output().await,
             "selectInterfaces": [
                 "ip", "dns", "port", "type", "main",
                 "available", "error", "errors_from", "disable_until"
@@ -111,7 +111,7 @@ impl ZabbixClient {
     /// `status_filter`: None=全部，Some(0)=启用，Some(1)=禁用。
     pub async fn hosts_light(&self, status_filter: Option<i64>) -> Result<Vec<Value>, AppError> {
         let mut params = json!({
-            "output": ["hostid", "host", "name", "status"],
+            "output": self.host_list_output().await,
             "selectInterfaces": [
                 "ip", "dns", "port", "type", "main",
                 "available", "error", "errors_from", "disable_until"
@@ -125,6 +125,16 @@ impl ZabbixClient {
         let result = self.call("host.get", params).await?;
         let hosts = result.as_array().cloned().unwrap_or_default();
         Ok(hosts.iter().map(|h| map_host(h, &[])).collect())
+    }
+
+    /// host.get 名册字段：含 Proxy 通道，便于同步写入对照表。
+    async fn host_list_output(&self) -> Vec<&'static str> {
+        let ver = self.version().await.unwrap_or_default();
+        let mut output = vec!["hostid", "host", "name", "status", "proxy_hostid"];
+        if !zabbix_version_lt_7_0(&ver) {
+            output.extend(["monitored_by", "proxyid", "proxy_groupid"]);
+        }
+        output
     }
 
     /// 只给当前页补 agent.version / agent.ping，避免全量 item.get。
@@ -1347,32 +1357,8 @@ impl ZabbixClient {
             .cloned()
             .ok_or_else(|| AppError::NotFound(format!("未找到主机 {host_id}")))?;
 
-        let mut channel = "direct";
-        let mut proxy_id = String::new();
-        let mut proxy_group_id = String::new();
-        if !zabbix_version_lt_7_0(&ver) {
-            let monitored_by = host["monitored_by"]
-                .as_i64()
-                .or_else(|| host["monitored_by"].as_str().and_then(|s| s.parse().ok()))
-                .unwrap_or(0);
-            match monitored_by {
-                1 => {
-                    channel = "proxy";
-                    proxy_id = host["proxyid"].as_str().unwrap_or("").to_string();
-                }
-                2 => {
-                    channel = "proxyGroup";
-                    proxy_group_id = host["proxy_groupid"].as_str().unwrap_or("").to_string();
-                }
-                _ => {}
-            }
-        } else {
-            let ph = host["proxy_hostid"].as_str().unwrap_or("0");
-            if ph != "0" && !ph.is_empty() {
-                channel = "proxy";
-                proxy_id = ph.to_string();
-            }
-        }
+        let (channel, proxy_id, proxy_group_id) =
+            host_monitoring_channel(&host, zabbix_version_lt_7_0(&ver));
 
         let interfaces = host["interfaces"]
             .as_array()
@@ -2449,6 +2435,12 @@ fn map_host(host: &Value, items: &[Value]) -> Value {
         .map(|s| s.to_string())
         .or_else(|| host["status"].as_i64().map(|n| n.to_string()))
         .unwrap_or_else(|| "0".to_string());
+    // 有 monitored_by 按 7.x 解析；否则按 6.x proxy_hostid
+    let ver_lt_7 = !host
+        .as_object()
+        .map(|o| o.contains_key("monitored_by"))
+        .unwrap_or(false);
+    let (channel, proxy_id, proxy_group_id) = host_monitoring_channel(host, ver_lt_7);
     json!({
         "hostId": host_id,
         "hostname": host["host"].as_str().unwrap_or(""),
@@ -2461,8 +2453,49 @@ fn map_host(host: &Value, items: &[Value]) -> Value {
         "interfaceAvailable": interface_available,
         "availability": availability,
         "agentVersion": version,
+        "channel": channel,
+        "proxyId": proxy_id,
+        "proxyGroupId": proxy_group_id,
         "groups": map_id_names(&host["hostgroups"], "groupid", "groupId"),
     })
+}
+
+/// 解析 Zabbix 主机监控通道 → (channel, proxy_id, proxy_group_id)。
+/// `ver_lt_7=true` 用 proxy_hostid；否则用 monitored_by / proxyid / proxy_groupid。
+fn host_monitoring_channel(host: &Value, ver_lt_7: bool) -> (String, String, String) {
+    let mut channel = "direct".to_string();
+    let mut proxy_id = String::new();
+    let mut proxy_group_id = String::new();
+    if !ver_lt_7 {
+        let monitored_by = host["monitored_by"]
+            .as_i64()
+            .or_else(|| host["monitored_by"].as_str().and_then(|s| s.parse().ok()))
+            .unwrap_or(0);
+        match monitored_by {
+            1 => {
+                channel = "proxy".into();
+                proxy_id = host["proxyid"].as_str().unwrap_or("").to_string();
+            }
+            2 => {
+                channel = "proxyGroup".into();
+                proxy_group_id = host["proxy_groupid"].as_str().unwrap_or("").to_string();
+            }
+            _ => {}
+        }
+    } else {
+        let ph = host["proxy_hostid"].as_str().unwrap_or("0");
+        if ph != "0" && !ph.is_empty() {
+            channel = "proxy".into();
+            proxy_id = ph.to_string();
+        }
+    }
+    if proxy_id == "0" {
+        proxy_id.clear();
+    }
+    if proxy_group_id == "0" {
+        proxy_group_id.clear();
+    }
+    (channel, proxy_id, proxy_group_id)
 }
 
 fn primary_agent_iface<'a>(host: &'a Value) -> Option<&'a Value> {

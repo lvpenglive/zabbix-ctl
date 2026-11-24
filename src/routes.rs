@@ -2,7 +2,7 @@ use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::auth::ServiceAuth;
 use crate::designer;
@@ -413,7 +413,7 @@ async fn enrich_hosts_with_links(
     use sqlx::Row;
     let rows = sqlx::query(
         "SELECT l.host_id, l.ci_id, l.install_path, l.package_id, l.conf_suffix, \
-                c.ssh_credential_id \
+                l.proxy_id, l.proxy_group_id, c.ssh_credential_id, c.ssh_exec_mode \
          FROM zbx_host_links l \
          LEFT JOIN ci_instances c ON c.id = l.ci_id \
          WHERE l.instance_code = ?",
@@ -422,34 +422,180 @@ async fn enrich_hosts_with_links(
     .fetch_all(pool)
     .await
     .map_err(|e| AppError::internal(e.to_string()))?;
+
+    // 已启用跳板的 proxy_id
+    let jump_rows = sqlx::query(
+        "SELECT proxy_id FROM monitor_ssh_jumps \
+         WHERE instance_code = ? AND enabled = 1",
+    )
+    .bind(instance_code)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+    let jump_proxies: std::collections::HashSet<String> = jump_rows
+        .iter()
+        .filter_map(|r| r.try_get::<String, _>("proxy_id").ok())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    // Proxy Group → 跳板 proxy
+    let map_rows = sqlx::query(
+        "SELECT proxy_group_id, jump_proxy_id FROM monitor_proxy_conf_maps \
+         WHERE instance_code = ? AND jump_proxy_id IS NOT NULL AND jump_proxy_id <> ''",
+    )
+    .bind(instance_code)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+    let group_jump: std::collections::HashMap<String, String> = map_rows
+        .iter()
+        .filter_map(|r| {
+            let gid = r.try_get::<String, _>("proxy_group_id").ok()?;
+            let jp = r.try_get::<String, _>("jump_proxy_id").ok()?;
+            if gid.is_empty() || jp.is_empty() {
+                None
+            } else {
+                Some((gid, jp))
+            }
+        })
+        .collect();
+
+    struct LinkMeta {
+        ci_id: Option<String>,
+        install_path: Option<String>,
+        package_id: Option<String>,
+        conf_suffix: Option<String>,
+        proxy_id: Option<String>,
+        proxy_group_id: Option<String>,
+        ssh_cred: Option<i64>,
+        ssh_exec_mode: Option<String>,
+    }
+
     let mut map = std::collections::HashMap::new();
     for r in rows {
         let host_id: String = r.try_get("host_id").unwrap_or_default();
-        let ci_id: Option<String> = r.try_get("ci_id").ok().flatten();
-        let install_path: Option<String> = r.try_get("install_path").ok().flatten();
-        let package_id: Option<String> = r.try_get("package_id").ok().flatten();
-        let conf_suffix: Option<String> = r.try_get("conf_suffix").ok().flatten();
-        let ssh_cred: Option<i64> = r.try_get("ssh_credential_id").ok().flatten();
         map.insert(
             host_id,
-            (ci_id, install_path, package_id, conf_suffix, ssh_cred),
+            LinkMeta {
+                ci_id: r.try_get("ci_id").ok().flatten(),
+                install_path: r.try_get("install_path").ok().flatten(),
+                package_id: r.try_get("package_id").ok().flatten(),
+                conf_suffix: r.try_get("conf_suffix").ok().flatten(),
+                proxy_id: r.try_get("proxy_id").ok().flatten(),
+                proxy_group_id: r.try_get("proxy_group_id").ok().flatten(),
+                ssh_cred: r.try_get("ssh_credential_id").ok().flatten(),
+                ssh_exec_mode: r.try_get("ssh_exec_mode").ok().flatten(),
+            },
         );
     }
     for h in hosts.iter_mut() {
         let id = h["hostId"].as_str().unwrap_or("").to_string();
-        if let Some((ci_id, install_path, package_id, conf_suffix, ssh_cred)) = map.get(&id) {
-            h["ciId"] = json!(ci_id);
-            h["installPath"] = json!(install_path);
-            h["packageId"] = json!(package_id);
-            h["confSuffix"] = json!(conf_suffix);
-            h["sshCredentialId"] = json!(ssh_cred);
-            h["sshCredentialBound"] = json!(ssh_cred.is_some());
+        // 名册自带的 Zabbix 通道优先；对照表作补充（尤其 sync 后）
+        let live_proxy = h["proxyId"].as_str().unwrap_or("").trim().to_string();
+        let live_group = h["proxyGroupId"].as_str().unwrap_or("").trim().to_string();
+        let live_channel = h["channel"].as_str().unwrap_or("").trim().to_string();
+
+        if let Some(meta) = map.get(&id) {
+            h["ciId"] = json!(meta.ci_id);
+            h["installPath"] = json!(meta.install_path);
+            h["packageId"] = json!(meta.package_id);
+            h["confSuffix"] = json!(meta.conf_suffix);
+            h["sshCredentialId"] = json!(meta.ssh_cred);
+            h["sshCredentialBound"] = json!(meta.ssh_cred.is_some());
+            h["sshExecMode"] = json!(meta.ssh_exec_mode.as_deref().unwrap_or("auto"));
+
+            let proxy_id = if !live_proxy.is_empty() {
+                live_proxy
+            } else {
+                meta.proxy_id.clone().unwrap_or_default()
+            };
+            let proxy_group_id = if !live_group.is_empty() {
+                live_group
+            } else {
+                meta.proxy_group_id.clone().unwrap_or_default()
+            };
+            let channel = if !live_channel.is_empty() {
+                live_channel
+            } else if !proxy_group_id.is_empty() {
+                "proxyGroup".into()
+            } else if !proxy_id.is_empty() {
+                "proxy".into()
+            } else {
+                "direct".into()
+            };
+            h["channel"] = json!(channel);
+            h["proxyId"] = json!(if proxy_id.is_empty() {
+                Value::Null
+            } else {
+                json!(proxy_id)
+            });
+            h["proxyGroupId"] = json!(if proxy_group_id.is_empty() {
+                Value::Null
+            } else {
+                json!(proxy_group_id)
+            });
+
+            let (ssh_path, jump_configured) = derive_ssh_path(
+                meta.ssh_exec_mode.as_deref(),
+                &proxy_id,
+                &proxy_group_id,
+                &jump_proxies,
+                &group_jump,
+            );
+            h["sshPath"] = json!(ssh_path);
+            h["sshJumpConfigured"] = json!(jump_configured);
         } else {
             h["sshCredentialBound"] = json!(false);
+            h["sshExecMode"] = json!("auto");
+            if live_channel.is_empty() {
+                h["channel"] = json!("direct");
+            }
+            let (ssh_path, jump_configured) = derive_ssh_path(
+                None,
+                &live_proxy,
+                &live_group,
+                &jump_proxies,
+                &group_jump,
+            );
+            h["sshPath"] = json!(ssh_path);
+            h["sshJumpConfigured"] = json!(jump_configured);
         }
         h["cmdbLinked"] = json!(h["ciId"].as_str().map(|s| !s.is_empty()).unwrap_or(false));
     }
     Ok(())
+}
+
+/// SSH 运维路径：direct=直连业务机；jump=经 ProxyJump。
+fn derive_ssh_path(
+    ssh_exec_mode: Option<&str>,
+    proxy_id: &str,
+    proxy_group_id: &str,
+    jump_proxies: &std::collections::HashSet<String>,
+    group_jump: &std::collections::HashMap<String, String>,
+) -> (&'static str, bool) {
+    let mode = ssh_exec_mode.unwrap_or("").trim().to_ascii_lowercase();
+    if mode == "direct" {
+        return ("direct", false);
+    }
+    let jump_proxy = if !proxy_id.trim().is_empty() {
+        proxy_id.trim().to_string()
+    } else if !proxy_group_id.trim().is_empty() {
+        group_jump
+            .get(proxy_group_id.trim())
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    if jump_proxy.is_empty() {
+        return ("direct", false);
+    }
+    if jump_proxies.contains(&jump_proxy) {
+        ("jump", true)
+    } else {
+        // 有监控通道但未配跳板 → 作业仍会直连（可能失败）
+        ("direct", false)
+    }
 }
 
 async fn host_problems(

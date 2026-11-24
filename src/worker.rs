@@ -1172,13 +1172,18 @@ pub async fn sync_host_links(
             .fetch_optional(pool)
             .await?
         };
+        let proxy_id = h["proxyId"].as_str().filter(|s| !s.is_empty());
+        let proxy_group_id = h["proxyGroupId"].as_str().filter(|s| !s.is_empty());
         sqlx::query(
             "INSERT INTO zbx_host_links \
-             (instance_code, host_id, hostname, ip, ci_id, agent_version, agent_available, synced_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP()) \
+             (instance_code, host_id, hostname, ip, ci_id, agent_version, agent_available, \
+              proxy_id, proxy_group_id, synced_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP()) \
              ON DUPLICATE KEY UPDATE hostname = VALUES(hostname), ip = VALUES(ip), \
                ci_id = COALESCE(VALUES(ci_id), ci_id), agent_version = VALUES(agent_version), \
-               agent_available = VALUES(agent_available), synced_at = UTC_TIMESTAMP()",
+               agent_available = VALUES(agent_available), \
+               proxy_id = VALUES(proxy_id), proxy_group_id = VALUES(proxy_group_id), \
+               synced_at = UTC_TIMESTAMP()",
         )
         .bind(instance_code)
         .bind(host_id)
@@ -1187,6 +1192,8 @@ pub async fn sync_host_links(
         .bind(ci_id)
         .bind(version)
         .bind(available)
+        .bind(proxy_id)
+        .bind(proxy_group_id)
         .execute(pool)
         .await?;
         n += 1;
