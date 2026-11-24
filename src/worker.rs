@@ -1140,10 +1140,12 @@ pub async fn get_task(pool: &DbPool, task_id: &str) -> anyhow::Result<Option<Val
 }
 
 /// 从 Zabbix 拉主机写入对照表，并按 IP 尝试匹配 ci_instances。
+/// `host_ids` 非空时只同步指定主机；空则同步全部启用主机。
 pub async fn sync_host_links(
     pool: &DbPool,
     state: &AppState,
     instance_code: &str,
+    host_ids: Option<&[String]>,
 ) -> anyhow::Result<usize> {
     let instance = state
         .config
@@ -1153,10 +1155,16 @@ pub async fn sync_host_links(
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("未找到实例"))?;
     let zbx = ZabbixClient::new(state.http.clone(), instance)?;
-    let hosts = zbx
-        .list_hosts(None, None)
-        .await
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    // 同步对照只需主机/IP/Proxy，不拉 agent.ping（全量 item.get 易超时）
+    let hosts = if let Some(ids) = host_ids.filter(|s| !s.is_empty()) {
+        zbx.hosts_by_ids(ids)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+    } else {
+        zbx.hosts_light(Some(0))
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+    };
     let mut n = 0usize;
     for h in hosts {
         let host_id = h["hostId"].as_str().unwrap_or("");

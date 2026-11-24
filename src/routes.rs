@@ -649,16 +649,29 @@ async fn host_triggers_list(
     Ok(Json(json!({ "code": 0, "data": triggers })))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncHostsBody {
+    #[serde(default)]
+    host_ids: Vec<String>,
+}
+
 async fn sync_hosts(
     State(state): State<AppState>,
     _auth: ServiceAuth,
     Path(code): Path<String>,
+    Json(body): Json<SyncHostsBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let pool = state
         .db
         .as_ref()
         .ok_or_else(|| AppError::bad("数据库未配置，无法同步主机对照"))?;
-    let n = worker::sync_host_links(pool, &state, &code)
+    let host_ids = if body.host_ids.is_empty() {
+        None
+    } else {
+        Some(body.host_ids.as_slice())
+    };
+    let n = worker::sync_host_links(pool, &state, &code, host_ids)
         .await
         .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(Json(json!({ "code": 0, "data": { "synced": n } })))

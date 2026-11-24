@@ -103,6 +103,28 @@ impl ZabbixClient {
             .collect())
     }
 
+    /// 按 hostid 拉轻量主机（含 Proxy 通道），供对照同步；不查监控项。
+    pub async fn hosts_by_ids(&self, host_ids: &[String]) -> Result<Vec<Value>, AppError> {
+        if host_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        for id in host_ids {
+            require_zbx_id(id)?;
+        }
+        let params = json!({
+            "output": self.host_list_output().await,
+            "hostids": host_ids,
+            "selectInterfaces": [
+                "ip", "dns", "port", "type", "main",
+                "available", "error", "errors_from", "disable_until"
+            ],
+            "selectHostGroups": ["groupid", "name"],
+        });
+        let result = self.call("host.get", params).await?;
+        let hosts = result.as_array().cloned().unwrap_or_default();
+        Ok(hosts.iter().map(|h| map_host(h, &[])).collect())
+    }
+
     /// 主机轻量名册（含启用/禁用）。不查监控项；通断先看接口 available，列表分页后再用 agent.ping 覆盖。
     pub async fn enabled_hosts_light(&self) -> Result<Vec<Value>, AppError> {
         self.hosts_light(None).await
