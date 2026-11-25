@@ -1061,11 +1061,13 @@ impl ZabbixClient {
         Ok(hosts
             .iter()
             .map(|h| {
+                let ips = agent_ips(h);
                 json!({
                     "hostId": h["hostid"].as_str().unwrap_or(""),
                     "hostname": h["host"].as_str().unwrap_or(""),
                     "displayName": h["name"].as_str().unwrap_or(""),
                     "ip": primary_ip(h),
+                    "ips": ips,
                     "port": primary_port(h),
                     "groups": map_id_names(&h["hostgroups"], "groupid", "groupId"),
                 })
@@ -2477,12 +2479,14 @@ fn map_host(host: &Value, items: &[Value]) -> Value {
         .map(|o| o.contains_key("monitored_by"))
         .unwrap_or(false);
     let (channel, proxy_id, proxy_group_id) = host_monitoring_channel(host, ver_lt_7);
+    let ips = agent_ips(host);
     json!({
         "hostId": host_id,
         "hostname": host["host"].as_str().unwrap_or(""),
         "displayName": host["name"].as_str().unwrap_or(""),
         "status": status,
         "ip": ip,
+        "ips": ips,
         "port": port,
         "agentAvailable": agent_available,
         "agentStatus": agent_status,
@@ -2537,7 +2541,14 @@ fn host_monitoring_channel(host: &Value, ver_lt_7: bool) -> (String, String, Str
 fn primary_agent_iface<'a>(host: &'a Value) -> Option<&'a Value> {
     let list = host["interfaces"].as_array()?;
     list.iter()
-        .find(|i| i["type"].as_str() == Some("1") || i["type"].as_i64() == Some(1))
+        .find(|i| {
+            (i["type"].as_str() == Some("1") || i["type"].as_i64() == Some(1))
+                && (i["main"].as_str() == Some("1") || i["main"].as_i64() == Some(1))
+        })
+        .or_else(|| {
+            list.iter()
+                .find(|i| i["type"].as_str() == Some("1") || i["type"].as_i64() == Some(1))
+        })
         .or_else(|| {
             list.iter()
                 .find(|i| i["main"].as_str() == Some("1") || i["main"].as_i64() == Some(1))
@@ -2545,17 +2556,54 @@ fn primary_agent_iface<'a>(host: &'a Value) -> Option<&'a Value> {
         .or_else(|| list.first())
 }
 
-fn primary_ip(host: &Value) -> String {
-    let Some(chosen) = primary_agent_iface(host) else {
-        return String::new();
-    };
-    chosen
+fn iface_ip(iface: &Value) -> Option<String> {
+    iface
         .get("ip")
         .and_then(|v| v.as_str())
+        .map(str::trim)
         .filter(|s| !s.is_empty())
-        .or_else(|| chosen.get("dns").and_then(|v| v.as_str()))
-        .unwrap_or("")
-        .to_string()
+        .map(|s| s.to_string())
+        .or_else(|| {
+            iface
+                .get("dns")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        })
+}
+
+/// 双网卡：收集全部 Agent(type=1) 接口 IP；没有 Agent 接口时退回全部接口。
+fn agent_ips(host: &Value) -> Vec<String> {
+    let Some(list) = host["interfaces"].as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let push_unique = |out: &mut Vec<String>, ip: String| {
+        if !out.iter().any(|x| x == &ip) {
+            out.push(ip);
+        }
+    };
+    for iface in list.iter().filter(|i| iface_type_is(i, 1)) {
+        if let Some(ip) = iface_ip(iface) {
+            push_unique(&mut out, ip);
+        }
+    }
+    if out.is_empty() {
+        for iface in list {
+            if let Some(ip) = iface_ip(iface) {
+                push_unique(&mut out, ip);
+            }
+        }
+    }
+    out
+}
+
+fn primary_ip(host: &Value) -> String {
+    primary_agent_iface(host)
+        .and_then(iface_ip)
+        .or_else(|| agent_ips(host).into_iter().next())
+        .unwrap_or_default()
 }
 
 fn primary_port(host: &Value) -> String {

@@ -629,7 +629,8 @@ async fn load_ci(pool: &DbPool, ci_id: &str) -> anyhow::Result<InstallCi> {
     .ok_or_else(|| anyhow::anyhow!("配置项不存在: {ci_id}"))?;
     let name: String = row.try_get("name").unwrap_or_default();
     let attributes: Value = row.try_get("attributes").unwrap_or(Value::Null);
-    let ip = ["ip", "mgmt_ip"]
+    // 安装/SSH：优先运维 IP，再回退业务 IP
+    let ip = ["mgmt_ip", "ip"]
         .iter()
         .find_map(|key| {
             attributes
@@ -639,7 +640,7 @@ async fn load_ci(pool: &DbPool, ci_id: &str) -> anyhow::Result<InstallCi> {
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string())
         })
-        .ok_or_else(|| anyhow::anyhow!("配置项 {name} 没有管理 IP"))?;
+        .ok_or_else(|| anyhow::anyhow!("配置项 {name} 没有运维/业务 IP"))?;
     let hostname = attributes
         .get("hostname")
         .and_then(|v| v.as_str())
@@ -1184,28 +1185,45 @@ pub async fn sync_host_links(
         let host_id = h["hostId"].as_str().unwrap_or("");
         let hostname = h["hostname"].as_str().unwrap_or("");
         let ip = h["ip"].as_str().unwrap_or("");
+        // 双网卡：用全部 Agent 接口 IP 去撞 CMDB（业务 ip / 运维 mgmt_ip / bk_host_innerip）
+        let mut match_ips: Vec<String> = h["ips"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if match_ips.is_empty() && !ip.is_empty() {
+            match_ips.push(ip.to_string());
+        }
         let version = h["agentVersion"].as_str();
         let available = match h["agentAvailable"].as_bool() {
             Some(true) => Some(1i8),
             Some(false) => Some(0i8),
             None => None,
         };
-        let ci_id: Option<String> = if ip.is_empty() {
-            None
-        } else {
-            sqlx::query_scalar(
+        let mut ci_id: Option<String> = None;
+        for cand in &match_ips {
+            ci_id = sqlx::query_scalar(
                 "SELECT id FROM ci_instances WHERE \
                  JSON_UNQUOTE(JSON_EXTRACT(attributes, '$.ip')) = ? \
                  OR JSON_UNQUOTE(JSON_EXTRACT(attributes, '$.mgmt_ip')) = ? \
                  OR JSON_UNQUOTE(JSON_EXTRACT(attributes, '$.bk_host_innerip')) = ? \
                  LIMIT 1",
             )
-            .bind(ip)
-            .bind(ip)
-            .bind(ip)
+            .bind(cand)
+            .bind(cand)
+            .bind(cand)
             .fetch_optional(pool)
-            .await?
-        };
+            .await?;
+            if ci_id.is_some() {
+                break;
+            }
+        }
         let proxy_id = h["proxyId"].as_str().filter(|s| !s.is_empty());
         let proxy_group_id = h["proxyGroupId"].as_str().filter(|s| !s.is_empty());
         sqlx::query(
