@@ -34,6 +34,8 @@ job_install_name = "Zabbix Agent 安装"
 code = "dc1"
 name = "主机房 Zabbix"
 api_url = "https://zabbix.example/api_jsonrpc.php"
+# 浏览器前端根（门户「在 Zabbix 打开」深链）。含子路径时写到 /zabbix；不要填 API 端口或 api_jsonrpc.php
+frontend_url = "https://zabbix.example"
 api_token = "change-me"
 # 写令牌。留空则写操作回退到 api_token。也可用环境变量 ZBX_TOKEN_DC1_WRITE。
 api_token_write = ""

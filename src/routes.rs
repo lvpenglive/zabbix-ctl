@@ -109,11 +109,17 @@ async fn list_instances(
         .iter()
         .filter(|z| z.enabled)
         .map(|z| {
+            let frontend = z.frontend_url.trim();
             json!({
                 "code": z.code,
                 "name": z.name,
                 "tokenConfigured": z.resolved_api_token().is_some(),
                 "protected": z.protected,
+                "frontendUrl": if frontend.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    json!(frontend.trim_end_matches('/'))
+                },
             })
         })
         .collect();

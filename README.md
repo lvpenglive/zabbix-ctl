@@ -25,6 +25,7 @@ Zabbix 纳管后端。只提供接口，没有页面。值班人员从 MeridianO
 |------|------|
 | `[server].service_token` | Gateway 调本服务（与 `MERIDIANOPS_ZABBIX_CTL_TOKEN` 相同） |
 | `[[zabbix]].api_token` | 该实例的 Zabbix API 令牌 |
+| `[[zabbix]].frontend_url` | Zabbix 前端根地址（门户深链；勿填 API URL） |
 | `[meridianops].job_token` | 调 Gateway 作业的 `mk-` 令牌（启停时需要） |
 | `[meridianops].default_install_path` | Agent 默认安装目录（全局）。主机对照 `install_path` 或安装任务未指定时使用；留空则用内置 `/opt/ITM/IIM/zabbix_agentd`。改默认目录只需改这里并重启服务 |
 

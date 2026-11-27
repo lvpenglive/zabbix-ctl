@@ -172,6 +172,10 @@ pub struct ZabbixInstanceConfig {
     pub code: String,
     pub name: String,
     pub api_url: String,
+    /// 浏览器可打开的 Zabbix 前端根地址（含子路径，如 `https://zabbix.example/zabbix`）。
+    /// 用于门户「在 Zabbix 打开」深链；勿填 API 地址（:10051 / api_jsonrpc.php）。
+    #[serde(default)]
+    pub frontend_url: String,
     /// Zabbix API 令牌。环境变量 ZBX_TOKEN_{CODE} 可覆盖。
     #[serde(default)]
     pub api_token: String,
