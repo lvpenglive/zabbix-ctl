@@ -671,10 +671,36 @@ async fn sync_hosts(
     } else {
         Some(body.host_ids.as_slice())
     };
-    let n = worker::sync_host_links(pool, &state, &code, host_ids)
+    let report = worker::sync_host_links(pool, &state, &code, host_ids)
         .await
         .map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(Json(json!({ "code": 0, "data": { "synced": n } })))
+    let conflicts: Vec<serde_json::Value> = report
+        .conflicts
+        .iter()
+        .map(|c| {
+            json!({
+                "hostId": c.host_id,
+                "hostname": c.hostname,
+                "ip": c.ip,
+                "matchIps": c.match_ips,
+                "candidates": c.candidates.iter().map(|x| json!({
+                    "ciId": x.ci_id,
+                    "name": x.name,
+                    "matchedIp": x.matched_ip,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "code": 0,
+        "data": {
+            "synced": report.synced,
+            "linked": report.linked,
+            "preserved": report.preserved,
+            "conflictCount": conflicts.len(),
+            "conflicts": conflicts,
+        }
+    })))
 }
 
 async fn governance(

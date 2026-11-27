@@ -1154,14 +1154,46 @@ pub async fn get_task(pool: &DbPool, task_id: &str) -> anyhow::Result<Option<Val
     })))
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SyncHostLinksReport {
+    /// 写入/更新对照行数
+    pub synced: usize,
+    /// 本次新写入 ci_id 的主机数（原先为空）
+    pub linked: usize,
+    /// 已有关联，本次同步保留未改绑
+    pub preserved: usize,
+    /// IP 命中多台 CI，未自动关联
+    pub conflicts: Vec<SyncCiConflict>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SyncCiConflict {
+    pub host_id: String,
+    pub hostname: String,
+    pub ip: String,
+    pub match_ips: Vec<String>,
+    pub candidates: Vec<SyncCiCandidate>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SyncCiCandidate {
+    pub ci_id: String,
+    pub name: String,
+    pub matched_ip: String,
+}
+
 /// 从 Zabbix 拉主机写入对照表，并按 IP 尝试匹配 ci_instances。
 /// `host_ids` 非空时只同步指定主机；空则同步全部启用主机。
+///
+/// 关联冲突保护：
+/// - 已有 `ci_id` 的对照行：同步不改绑（只更新主机元数据）
+/// - 同一主机 IP 命中多台 CI：不自动关联，记入 conflicts
 pub async fn sync_host_links(
     pool: &DbPool,
     state: &AppState,
     instance_code: &str,
     host_ids: Option<&[String]>,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<SyncHostLinksReport> {
     let instance = state
         .config
         .zabbix
@@ -1180,7 +1212,7 @@ pub async fn sync_host_links(
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?
     };
-    let mut n = 0usize;
+    let mut report = SyncHostLinksReport::default();
     for h in hosts {
         let host_id = h["hostId"].as_str().unwrap_or("");
         let hostname = h["hostname"].as_str().unwrap_or("");
@@ -1206,33 +1238,53 @@ pub async fn sync_host_links(
             Some(false) => Some(0i8),
             None => None,
         };
-        let mut ci_id: Option<String> = None;
-        for cand in &match_ips {
-            ci_id = sqlx::query_scalar(
-                "SELECT id FROM ci_instances WHERE \
-                 JSON_UNQUOTE(JSON_EXTRACT(attributes, '$.ip')) = ? \
-                 OR JSON_UNQUOTE(JSON_EXTRACT(attributes, '$.mgmt_ip')) = ? \
-                 OR JSON_UNQUOTE(JSON_EXTRACT(attributes, '$.bk_host_innerip')) = ? \
-                 LIMIT 1",
-            )
-            .bind(cand)
-            .bind(cand)
-            .bind(cand)
-            .fetch_optional(pool)
-            .await?;
-            if ci_id.is_some() {
-                break;
+
+        let existing_ci: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT ci_id FROM zbx_host_links WHERE instance_code = ? AND host_id = ?",
+        )
+        .bind(instance_code)
+        .bind(host_id)
+        .fetch_optional(pool)
+        .await?
+        .flatten()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+        let mut auto_ci: Option<String> = None;
+        if existing_ci.is_some() {
+            report.preserved += 1;
+        } else if !match_ips.is_empty() {
+            let candidates = match_ci_candidates(pool, &match_ips).await?;
+            let mut unique: Vec<SyncCiCandidate> = Vec::new();
+            for c in candidates {
+                if !unique.iter().any(|u| u.ci_id == c.ci_id) {
+                    unique.push(c);
+                }
+            }
+            if unique.len() > 1 {
+                report.conflicts.push(SyncCiConflict {
+                    host_id: host_id.to_string(),
+                    hostname: hostname.to_string(),
+                    ip: ip.to_string(),
+                    match_ips: match_ips.clone(),
+                    candidates: unique,
+                });
+            } else if let Some(one) = unique.into_iter().next() {
+                auto_ci = Some(one.ci_id);
             }
         }
+
         let proxy_id = h["proxyId"].as_str().filter(|s| !s.is_empty());
         let proxy_group_id = h["proxyGroupId"].as_str().filter(|s| !s.is_empty());
+        // 已有关联：COALESCE(ci_id, VALUES) 保留原 ci_id；新建/空关联才写入 auto_ci
         sqlx::query(
             "INSERT INTO zbx_host_links \
              (instance_code, host_id, hostname, ip, ci_id, agent_version, agent_available, \
               proxy_id, proxy_group_id, synced_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP()) \
              ON DUPLICATE KEY UPDATE hostname = VALUES(hostname), ip = VALUES(ip), \
-               ci_id = COALESCE(VALUES(ci_id), ci_id), agent_version = VALUES(agent_version), \
+               ci_id = COALESCE(NULLIF(ci_id, ''), VALUES(ci_id)), \
+               agent_version = VALUES(agent_version), \
                agent_available = VALUES(agent_available), \
                proxy_id = VALUES(proxy_id), proxy_group_id = VALUES(proxy_group_id), \
                synced_at = UTC_TIMESTAMP()",
@@ -1241,14 +1293,50 @@ pub async fn sync_host_links(
         .bind(host_id)
         .bind(hostname)
         .bind(ip)
-        .bind(ci_id)
+        .bind(auto_ci.as_deref())
         .bind(version)
         .bind(available)
         .bind(proxy_id)
         .bind(proxy_group_id)
         .execute(pool)
         .await?;
-        n += 1;
+        if existing_ci.is_none() && auto_ci.is_some() {
+            report.linked += 1;
+        }
+        report.synced += 1;
     }
-    Ok(n)
+    Ok(report)
+}
+
+async fn match_ci_candidates(
+    pool: &DbPool,
+    match_ips: &[String],
+) -> anyhow::Result<Vec<SyncCiCandidate>> {
+    let mut out = Vec::new();
+    for cand in match_ips {
+        let rows = sqlx::query(
+            "SELECT id, name FROM ci_instances WHERE \
+             JSON_UNQUOTE(JSON_EXTRACT(attributes, '$.ip')) = ? \
+             OR JSON_UNQUOTE(JSON_EXTRACT(attributes, '$.mgmt_ip')) = ? \
+             OR JSON_UNQUOTE(JSON_EXTRACT(attributes, '$.bk_host_innerip')) = ?",
+        )
+        .bind(cand)
+        .bind(cand)
+        .bind(cand)
+        .fetch_all(pool)
+        .await?;
+        for r in rows {
+            let ci_id: String = r.try_get("id").unwrap_or_default();
+            let name: String = r.try_get("name").unwrap_or_default();
+            if ci_id.is_empty() {
+                continue;
+            }
+            out.push(SyncCiCandidate {
+                ci_id,
+                name,
+                matched_ip: cand.clone(),
+            });
+        }
+    }
+    Ok(out)
 }
